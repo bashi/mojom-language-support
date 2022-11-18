@@ -12,14 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use structopt::StructOpt;
+use clap::Parser;
 
-#[derive(StructOpt)]
-struct Opt {}
+#[derive(Parser)]
+#[command(version)]
+struct Args {}
 
 pub fn main() -> anyhow::Result<()> {
     // For help/version information. There is no option now.
-    let _ = Opt::from_args();
+    let _ = Args::parse();
 
     env_logger::init();
 
