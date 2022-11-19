@@ -52,6 +52,17 @@ fn consume_as_range(pairs: &mut Pairs) -> Range {
     pairs.next().unwrap().as_span().into()
 }
 
+fn consume_as_type(pairs: &mut Pairs) -> Range {
+    pairs
+        .next()
+        .unwrap()
+        .into_inner()
+        .next()
+        .unwrap()
+        .as_span()
+        .into()
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Module {
     pub name: Range,
@@ -88,8 +99,7 @@ pub struct Const {
 fn into_const(mut pairs: Pairs) -> Const {
     skip_attribute_list(&mut pairs);
     consume_token(Rule::t_const, &mut pairs);
-    let pair = pairs.next().unwrap();
-    let typ = pair.as_span().into();
+    let typ = consume_as_type(&mut pairs);
     let name = consume_as_range(&mut pairs);
     consume_token(Rule::t_equal, &mut pairs);
     let value = consume_as_range(&mut pairs);
@@ -166,7 +176,7 @@ pub struct StructField {
 
 fn into_struct_field(mut pairs: Pairs) -> StructField {
     skip_attribute_list(&mut pairs);
-    let typ = consume_as_range(&mut pairs);
+    let typ = consume_as_type(&mut pairs);
     let name = consume_as_range(&mut pairs);
     let mut res = StructField {
         typ: typ,
@@ -255,7 +265,7 @@ pub struct UnionField {
 
 fn into_union_field(mut pairs: Pairs) -> UnionField {
     skip_attribute_list(&mut pairs);
-    let typ = consume_as_range(&mut pairs);
+    let typ = consume_as_type(&mut pairs);
     let name = consume_as_range(&mut pairs);
     let mut ordinal = None;
     for item in pairs {
@@ -308,7 +318,7 @@ pub struct Parameter {
 }
 
 fn into_parameter(mut pairs: Pairs) -> Parameter {
-    let typ = consume_as_range(&mut pairs);
+    let typ = consume_as_type(&mut pairs);
     let name = consume_as_range(&mut pairs);
     let ordinal = pairs.next().map(|ord| ord.as_span().into());
     Parameter {
