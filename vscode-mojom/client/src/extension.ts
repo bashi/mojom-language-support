@@ -25,17 +25,17 @@ import {
   State,
 } from "vscode-languageclient/node";
 
-const SERVER_COMMAND = "mojom-lsp";
+const DEFAULT_SERVER_COMMAND = "mojom-lsp";
 
 let client: LanguageClient | null = null;
 let lspStatusBarItem: vscode.StatusBarItem;
 
-function startClient() {
-  let serverOptions: Executable = {
-    command: SERVER_COMMAND,
+function startClient(serverPath: string) {
+  const serverOptions: Executable = {
+    command: serverPath,
   };
 
-  let clientOptions: LanguageClientOptions = {
+  const clientOptions: LanguageClientOptions = {
     documentSelector: [{ scheme: "file", language: "mojom" }],
   };
 
@@ -81,6 +81,27 @@ async function stopClient(): Promise<void> {
   return result;
 }
 
+function substituteVariableReferences(value: string): string {
+  return value.replace(/\$\{(.+)\}/g, (match, capture) => {
+    return resolveVariableReference(capture) || match;
+  });
+}
+
+// Resolves subset of variable references.
+// https://code.visualstudio.com/docs/editor/variables-reference
+function resolveVariableReference(name: string): string | undefined {
+  if (name === "workspaceRoot" && vscode.workspace.workspaceFolders.length > 0) {
+    return vscode.workspace.workspaceFolders[0].uri.fsPath;
+  }
+  if (name.startsWith("env:")) {
+    return process.env[name.substring(4)] || "";
+  }
+  if (name === "userHome") {
+    return process.env["HOME"];
+  }
+  return undefined;
+}
+
 async function hasCommand(command: string): Promise<boolean> {
   return new Promise<boolean>((resolve) => {
     const checkCommand = process.platform === "win32" ? "where" : "command -v";
@@ -89,10 +110,6 @@ async function hasCommand(command: string): Promise<boolean> {
       resolve(code === 0);
     });
   });
-}
-
-async function isLanguageServerIsAvailable(): Promise<boolean> {
-  return hasCommand(SERVER_COMMAND);
 }
 
 async function isCargoAvaiable(): Promise<boolean> {
@@ -122,6 +139,11 @@ async function installServerBinary(): Promise<boolean> {
   return promise;
 }
 
+function getServerPath(configuration: vscode.WorkspaceConfiguration): string {
+  const rawServerPath = configuration.get<string>("languageServerPath");
+  return substituteVariableReferences(rawServerPath);
+}
+
 async function tryToInstallLanguageServer(
   configuration: vscode.WorkspaceConfiguration
 ) {
@@ -141,7 +163,8 @@ async function tryToInstallLanguageServer(
   if (selected === "Yes") {
     const installed = await installServerBinary();
     if (installed) {
-      startClient();
+      const serverPath = getServerPath(configuration);
+      startClient(serverPath);
     } else {
       configuration.update("enableLanguageServer", "Disabled");
     }
@@ -152,11 +175,12 @@ async function tryToInstallLanguageServer(
 
 async function applyConfigurations() {
   const configuration = vscode.workspace.getConfiguration("mojom");
+  const serverPath = getServerPath(configuration);
   const enableLanguageServer = configuration.get<string>("enableLanguageServer");
-  const shouldStartClient = (enableLanguageServer === "Enabled") && (await isLanguageServerIsAvailable());
+  const shouldStartClient = (enableLanguageServer === "Enabled") && (await hasCommand(serverPath));
   if (shouldStartClient) {
-    startClient();
-  } else if (enableLanguageServer === "Enabled") {
+    startClient(serverPath);
+  } else if (enableLanguageServer === "Enabled" && serverPath === DEFAULT_SERVER_COMMAND) {
     tryToInstallLanguageServer(configuration);
   } else if (enableLanguageServer !== "Enabled") {
     stopClient();

@@ -47,8 +47,16 @@
         "mojom.enableLanguageServer": {
           "type": "string",
           "default": "Enabled",
-          "enum": ["Enabled", "Disabled", "Never"],
+          "enum": [
+            "Enabled",
+            "Disabled",
+            "Never"
+          ],
           "description": "Enable Mojom Language Server."
+        },
+        "mojom.languageServerPath": {
+          "type": "string",
+          "default": "mojom-lsp"
         }
       }
     },
