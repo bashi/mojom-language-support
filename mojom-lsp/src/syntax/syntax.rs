@@ -14,7 +14,7 @@
 
 use pest::{Parser, Position, Span};
 
-use super::parser::{consume_token, MojomParser, Pairs, Rule};
+use super::parser::{consume_token, MojomParser, Pair, Pairs, Rule};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Range {
@@ -65,38 +65,47 @@ fn consume_as_type(pairs: &mut Pairs) -> Range {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Module {
+    pub range: Range,
     pub name: Range,
 }
 
-fn into_module(mut pairs: Pairs) -> Module {
+fn into_module(pair: Pair) -> Module {
+    let range = pair.as_span().into();
+    let mut pairs = pair.into_inner();
     skip_attribute_list(&mut pairs);
     consume_token(Rule::t_module, &mut pairs);
     let name = consume_as_range(&mut pairs);
     consume_semicolon(&mut pairs);
-    Module { name: name }
+    Module { range, name }
 }
 
 #[derive(Debug, PartialEq)]
 pub struct Import {
+    pub range: Range,
     pub path: Range,
 }
 
-fn into_import(mut pairs: Pairs) -> Import {
+fn into_import(pair: Pair) -> Import {
+    let range = pair.as_span().into();
+    let mut pairs = pair.into_inner();
     skip_attribute_list(&mut pairs);
     consume_token(Rule::t_import, &mut pairs);
     let path = consume_as_range(&mut pairs);
     consume_semicolon(&mut pairs);
-    Import { path: path }
+    Import { range, path }
 }
 
 #[derive(Debug, PartialEq)]
 pub struct Const {
+    pub range: Range,
     pub typ: Range,
     pub name: Range,
     pub value: Range,
 }
 
-fn into_const(mut pairs: Pairs) -> Const {
+fn into_const(pair: Pair) -> Const {
+    let range = pair.as_span().into();
+    let mut pairs = pair.into_inner();
     skip_attribute_list(&mut pairs);
     consume_token(Rule::t_const, &mut pairs);
     let typ = consume_as_type(&mut pairs);
@@ -105,19 +114,23 @@ fn into_const(mut pairs: Pairs) -> Const {
     let value = consume_as_range(&mut pairs);
     consume_semicolon(&mut pairs);
     Const {
-        typ: typ,
-        name: name,
-        value: value,
+        range,
+        typ,
+        name,
+        value,
     }
 }
 
 #[derive(Debug, PartialEq)]
 pub struct EnumValue {
+    pub range: Range,
     pub name: Range,
     pub value: Option<Range>,
 }
 
-fn into_enum_value(mut pairs: Pairs) -> EnumValue {
+fn into_enum_value(pair: Pair) -> EnumValue {
+    let range = pair.as_span().into();
+    let mut pairs = pair.into_inner();
     skip_attribute_list(&mut pairs);
     let name = consume_as_range(&mut pairs);
     // The next item should be t_equal when it's Some(item).
@@ -125,19 +138,19 @@ fn into_enum_value(mut pairs: Pairs) -> EnumValue {
         assert!(item.as_rule() == Rule::t_equal);
     }
     let value = pairs.next().map(|item| item.as_span().into());
-    EnumValue {
-        name: name,
-        value: value,
-    }
+    EnumValue { range, name, value }
 }
 
 #[derive(Debug, PartialEq)]
 pub struct Enum {
+    pub range: Range,
     pub name: Range,
     pub values: Vec<EnumValue>,
 }
 
-fn into_enum(mut pairs: Pairs) -> Enum {
+fn into_enum(pair: Pair) -> Enum {
+    let range = pair.as_span().into();
+    let mut pairs = pair.into_inner();
     skip_attribute_list(&mut pairs);
     let name = consume_as_range(&mut pairs);
     let mut values = Vec::new();
@@ -148,7 +161,7 @@ fn into_enum(mut pairs: Pairs) -> Enum {
                 consume_token(Rule::t_lbrace, &mut pairs);
                 for item in pairs {
                     let value = match item.as_rule() {
-                        Rule::enum_value => into_enum_value(item.into_inner()),
+                        Rule::enum_value => into_enum_value(item),
                         Rule::t_comma => continue,
                         Rule::t_rbrace => break,
                         _ => unreachable!(),
@@ -161,26 +174,31 @@ fn into_enum(mut pairs: Pairs) -> Enum {
         }
     }
     Enum {
-        name: name,
-        values: values,
+        range,
+        name,
+        values,
     }
 }
 
 #[derive(Debug, PartialEq)]
 pub struct StructField {
+    pub range: Range,
     pub typ: Range,
     pub name: Range,
     pub ordinal: Option<Range>,
     pub default: Option<Range>,
 }
 
-fn into_struct_field(mut pairs: Pairs) -> StructField {
+fn into_struct_field(pair: Pair) -> StructField {
+    let range = pair.as_span().into();
+    let mut pairs = pair.into_inner();
     skip_attribute_list(&mut pairs);
     let typ = consume_as_type(&mut pairs);
     let name = consume_as_range(&mut pairs);
     let mut res = StructField {
-        typ: typ,
-        name: name,
+        range,
+        typ,
+        name,
         ordinal: None,
         default: None,
     };
@@ -208,11 +226,13 @@ pub enum StructBody {
 
 #[derive(Debug, PartialEq)]
 pub struct Struct {
+    pub range: Range,
     pub name: Range,
     pub members: Vec<StructBody>,
 }
 
-fn into_struct_members(mut pairs: Pairs) -> Vec<StructBody> {
+fn into_struct_members(pair: Pair) -> Vec<StructBody> {
+    let mut pairs = pair.into_inner();
     consume_token(Rule::t_lbrace, &mut pairs);
     let mut members = Vec::new();
     for item in pairs {
@@ -222,9 +242,9 @@ fn into_struct_members(mut pairs: Pairs) -> Vec<StructBody> {
         // At this point `item` should have only one inner and it should be struct_item.
         let struct_item = item.into_inner().next().unwrap();
         let member = match struct_item.as_rule() {
-            Rule::const_stmt => StructBody::Const(into_const(struct_item.into_inner())),
-            Rule::enum_stmt => StructBody::Enum(into_enum(struct_item.into_inner())),
-            Rule::struct_field => StructBody::Field(into_struct_field(struct_item.into_inner())),
+            Rule::const_stmt => StructBody::Const(into_const(struct_item)),
+            Rule::enum_stmt => StructBody::Enum(into_enum(struct_item)),
+            Rule::struct_field => StructBody::Field(into_struct_field(struct_item)),
             _ => unreachable!(),
         };
         members.push(member);
@@ -232,7 +252,9 @@ fn into_struct_members(mut pairs: Pairs) -> Vec<StructBody> {
     members
 }
 
-fn into_struct(mut pairs: Pairs) -> Struct {
+fn into_struct(pair: Pair) -> Struct {
+    let range = pair.as_span().into();
+    let mut pairs = pair.into_inner();
     skip_attribute_list(&mut pairs);
     consume_token(Rule::t_struct, &mut pairs);
     let name = consume_as_range(&mut pairs);
@@ -240,16 +262,18 @@ fn into_struct(mut pairs: Pairs) -> Struct {
     match item.as_rule() {
         Rule::t_semicolon => {
             return Struct {
-                name: name,
+                range,
+                name,
                 members: Vec::new(),
             };
         }
         Rule::struct_body => {
-            let members = into_struct_members(item.into_inner());
+            let members = into_struct_members(item);
             consume_semicolon(&mut pairs);
             return Struct {
-                name: name,
-                members: members,
+                range,
+                name,
+                members,
             };
         }
         _ => unreachable!(),
@@ -258,12 +282,15 @@ fn into_struct(mut pairs: Pairs) -> Struct {
 
 #[derive(Debug, PartialEq)]
 pub struct UnionField {
+    pub range: Range,
     pub typ: Range,
     pub name: Range,
     pub ordinal: Option<Range>,
 }
 
-fn into_union_field(mut pairs: Pairs) -> UnionField {
+fn into_union_field(pair: Pair) -> UnionField {
+    let range = pair.as_span().into();
+    let mut pairs = pair.into_inner();
     skip_attribute_list(&mut pairs);
     let typ = consume_as_type(&mut pairs);
     let name = consume_as_range(&mut pairs);
@@ -276,19 +303,23 @@ fn into_union_field(mut pairs: Pairs) -> UnionField {
         }
     }
     UnionField {
-        typ: typ,
-        name: name,
-        ordinal: ordinal,
+        range,
+        typ,
+        name,
+        ordinal,
     }
 }
 
 #[derive(Debug, PartialEq)]
 pub struct Union {
+    pub range: Range,
     pub name: Range,
     pub fields: Vec<UnionField>,
 }
 
-fn into_union(mut pairs: Pairs) -> Union {
+fn into_union(pair: Pair) -> Union {
+    let range = pair.as_span().into();
+    let mut pairs = pair.into_inner();
     skip_attribute_list(&mut pairs);
     consume_token(Rule::t_union, &mut pairs);
     let name = consume_as_range(&mut pairs);
@@ -297,7 +328,7 @@ fn into_union(mut pairs: Pairs) -> Union {
     loop {
         let item = pairs.next().unwrap();
         let item = match item.as_rule() {
-            Rule::union_field => into_union_field(item.into_inner()),
+            Rule::union_field => into_union_field(item),
             Rule::t_rbrace => break,
             _ => unreachable!(),
         };
@@ -305,35 +336,41 @@ fn into_union(mut pairs: Pairs) -> Union {
     }
     consume_semicolon(&mut pairs);
     Union {
-        name: name,
-        fields: fields,
+        range,
+        name,
+        fields,
     }
 }
 
 #[derive(Debug, PartialEq)]
 pub struct Parameter {
+    pub range: Range,
     pub typ: Range,
     pub name: Range,
     pub ordinal: Option<Range>,
 }
 
-fn into_parameter(mut pairs: Pairs) -> Parameter {
+fn into_parameter(pair: Pair) -> Parameter {
+    let range = pair.as_span().into();
+    let mut pairs = pair.into_inner();
     let typ = consume_as_type(&mut pairs);
     let name = consume_as_range(&mut pairs);
     let ordinal = pairs.next().map(|ord| ord.as_span().into());
     Parameter {
-        typ: typ,
-        name: name,
-        ordinal: ordinal,
+        range,
+        typ,
+        name,
+        ordinal,
     }
 }
 
-fn parameter_list(mut pairs: Pairs) -> Vec<Parameter> {
+fn into_parameter_list(pair: Pair) -> Vec<Parameter> {
+    let mut pairs = pair.into_inner();
     consume_token(Rule::t_lparen, &mut pairs);
     let mut params = Vec::new();
     for item in pairs {
         let param = match item.as_rule() {
-            Rule::parameter => into_parameter(item.into_inner()),
+            Rule::parameter => into_parameter(item),
             Rule::t_comma => continue,
             Rule::t_rparen => break,
             _ => unreachable!(),
@@ -345,44 +382,51 @@ fn parameter_list(mut pairs: Pairs) -> Vec<Parameter> {
 
 #[derive(Debug, PartialEq)]
 pub struct Response {
+    pub range: Range,
     pub params: Vec<Parameter>,
 }
 
-fn into_response(mut pairs: Pairs) -> Response {
+fn into_response(pair: Pair) -> Response {
+    let range = pair.as_span().into();
+    let mut pairs = pair.into_inner();
     consume_token(Rule::t_arrow, &mut pairs);
-    let params = parameter_list(pairs.next().unwrap().into_inner());
-    Response { params: params }
+    let params = into_parameter_list(pairs.next().unwrap());
+    Response { range, params }
 }
 
 #[derive(Debug, PartialEq)]
 pub struct Method {
+    pub range: Range,
     pub name: Range,
     pub ordinal: Option<Range>,
     pub params: Vec<Parameter>,
     pub response: Option<Response>,
 }
 
-fn into_method(mut pairs: Pairs) -> Method {
+fn into_method(pair: Pair) -> Method {
+    let range = pair.as_span().into();
+    let mut pairs = pair.into_inner();
     skip_attribute_list(&mut pairs);
     let name = consume_as_range(&mut pairs);
     let ordinal = match pairs.peek().unwrap().as_rule() {
         Rule::ordinal_value => pairs.next().map(|ord| ord.as_span().into()),
         _ => None,
     };
-    let params = parameter_list(pairs.next().unwrap().into_inner());
+    let params = into_parameter_list(pairs.next().unwrap());
     let mut response = None;
     for item in pairs {
         match item.as_rule() {
-            Rule::response => response = Some(into_response(item.into_inner())),
+            Rule::response => response = Some(into_response(item)),
             Rule::t_semicolon => break,
             _ => unreachable!(),
         }
     }
     Method {
-        name: name,
-        ordinal: ordinal,
-        params: params,
-        response: response,
+        range,
+        name,
+        ordinal,
+        params,
+        response,
     }
 }
 
@@ -393,23 +437,27 @@ pub enum InterfaceMember {
     Method(Method),
 }
 
-fn into_interface_member(mut pairs: Pairs) -> InterfaceMember {
+fn into_interface_member(pair: Pair) -> InterfaceMember {
+    let mut pairs = pair.into_inner();
     let member = pairs.next().unwrap();
     match member.as_rule() {
-        Rule::const_stmt => InterfaceMember::Const(into_const(member.into_inner())),
-        Rule::enum_stmt => InterfaceMember::Enum(into_enum(member.into_inner())),
-        Rule::method_stmt => InterfaceMember::Method(into_method(member.into_inner())),
+        Rule::const_stmt => InterfaceMember::Const(into_const(member)),
+        Rule::enum_stmt => InterfaceMember::Enum(into_enum(member)),
+        Rule::method_stmt => InterfaceMember::Method(into_method(member)),
         _ => unreachable!(),
     }
 }
 
 #[derive(Debug, PartialEq)]
 pub struct Interface {
+    pub range: Range,
     pub name: Range,
     pub members: Vec<InterfaceMember>,
 }
 
-fn into_interface(mut pairs: Pairs) -> Interface {
+fn into_interface(pair: Pair) -> Interface {
+    let range = pair.as_span().into();
+    let mut pairs = pair.into_inner();
     skip_attribute_list(&mut pairs);
     consume_token(Rule::t_interface, &mut pairs);
     let name = consume_as_range(&mut pairs);
@@ -420,7 +468,7 @@ fn into_interface(mut pairs: Pairs) -> Interface {
         let item = pairs.next().unwrap(); // Should not be None.
         match item.as_rule() {
             Rule::interface_body => {
-                let member = into_interface_member(item.into_inner());
+                let member = into_interface_member(item);
                 members.push(member);
             }
             Rule::t_rbrace => break,
@@ -429,8 +477,9 @@ fn into_interface(mut pairs: Pairs) -> Interface {
     }
     consume_semicolon(&mut pairs);
     Interface {
-        name: name,
-        members: members,
+        range,
+        name,
+        members,
     }
 }
 
@@ -445,16 +494,18 @@ pub enum Statement {
     Const(Const),
 }
 
-fn into_statement(mut pairs: Pairs) -> Statement {
+fn into_statement(pair: Pair) -> Statement {
+    // We don't need range information for statements.
+    let mut pairs = pair.into_inner();
     let stmt = pairs.next().unwrap();
     match stmt.as_rule() {
-        Rule::module_stmt => Statement::Module(into_module(stmt.into_inner())),
-        Rule::import_stmt => Statement::Import(into_import(stmt.into_inner())),
-        Rule::interface => Statement::Interface(into_interface(stmt.into_inner())),
-        Rule::struct_stmt => Statement::Struct(into_struct(stmt.into_inner())),
-        Rule::union_stmt => Statement::Union(into_union(stmt.into_inner())),
-        Rule::enum_stmt => Statement::Enum(into_enum(stmt.into_inner())),
-        Rule::const_stmt => Statement::Const(into_const(stmt.into_inner())),
+        Rule::module_stmt => Statement::Module(into_module(stmt)),
+        Rule::import_stmt => Statement::Import(into_import(stmt)),
+        Rule::interface => Statement::Interface(into_interface(stmt)),
+        Rule::struct_stmt => Statement::Struct(into_struct(stmt)),
+        Rule::union_stmt => Statement::Union(into_union(stmt)),
+        Rule::enum_stmt => Statement::Enum(into_enum(stmt)),
+        Rule::const_stmt => Statement::Const(into_const(stmt)),
         _ => unreachable!(),
     }
 }
@@ -464,11 +515,12 @@ pub struct MojomFile {
     pub stmts: Vec<Statement>,
 }
 
-fn into_mojom_file(pairs: Pairs) -> MojomFile {
+fn into_mojom_file(pair: Pair) -> MojomFile {
+    let pairs = pair.into_inner();
     let mut stmts = Vec::new();
     for stmt in pairs {
         let stmt = match stmt.as_rule() {
-            Rule::statement => into_statement(stmt.into_inner()),
+            Rule::statement => into_statement(stmt),
             Rule::EOI => break,
             _ => unreachable!(),
         };
@@ -577,7 +629,7 @@ fn parse_input(input: &str) -> Result<Pairs, PestError> {
 }
 
 fn build_syntax_tree(mut pairs: Pairs) -> MojomFile {
-    let inner = pairs.next().unwrap().into_inner();
+    let inner = pairs.next().unwrap();
     into_mojom_file(inner)
 }
 
@@ -738,7 +790,8 @@ mod tests {
             .unwrap()
             .next()
             .unwrap();
-        let stmt = into_module(parsed.into_inner());
+        let stmt = into_module(parsed);
+        assert_eq!(stmt.range, Range { start: 0, end: 14 });
         assert_eq!("my.mod", partial_text(&input, &stmt.name));
     }
 
@@ -749,7 +802,8 @@ mod tests {
             .unwrap()
             .next()
             .unwrap();
-        let stmt = into_import(parsed.into_inner());
+        let stmt = into_import(parsed);
+        assert_eq!(stmt.range, Range { start: 0, end: 16 });
         assert_eq!(r#""my.mod""#, partial_text(&input, &stmt.path));
 
         let input = r#"[Attr] import "my.mod";"#;
@@ -757,7 +811,8 @@ mod tests {
             .unwrap()
             .next()
             .unwrap();
-        let stmt = into_import(parsed.into_inner());
+        let stmt = into_import(parsed);
+        assert_eq!(stmt.range, Range { start: 0, end: 23 });
         assert_eq!(r#""my.mod""#, partial_text(&input, &stmt.path));
     }
 
@@ -768,7 +823,8 @@ mod tests {
             .unwrap()
             .next()
             .unwrap();
-        let stmt = into_const(parsed.into_inner());
+        let stmt = into_const(parsed);
+        assert_eq!(stmt.range, Range { start: 0, end: 29 });
         assert_eq!("uint32", partial_text(&input, &stmt.typ));
         assert_eq!("kTheAnswer", partial_text(&input, &stmt.name));
         assert_eq!("42", partial_text(&input, &stmt.value));
@@ -781,7 +837,8 @@ mod tests {
             .unwrap()
             .next()
             .unwrap();
-        let stmt = into_enum(parsed.into_inner());
+        let stmt = into_enum(parsed);
+        assert_eq!(stmt.range, Range { start: 0, end: 49 });
         assert_eq!("MyEnum", partial_text(&input, &stmt.name));
         let values = &stmt.values;
         assert_eq!(3, values.len());
@@ -799,7 +856,8 @@ mod tests {
             .unwrap()
             .next()
             .unwrap();
-        let stmt = into_enum(parsed.into_inner());
+        let stmt = into_enum(parsed);
+        assert_eq!(stmt.range, Range { start: 0, end: 15 });
         assert_eq!("MyEnum", partial_text(&input, &stmt.name));
         assert_eq!(0, stmt.values.len());
 
@@ -808,7 +866,8 @@ mod tests {
             .unwrap()
             .next()
             .unwrap();
-        let stmt = into_enum(parsed.into_inner());
+        let stmt = into_enum(parsed);
+        assert_eq!(stmt.range, Range { start: 0, end: 21 });
         assert_eq!("MyEnum", partial_text(&input, &stmt.name));
         assert_eq!(0, stmt.values.len());
     }
@@ -820,7 +879,8 @@ mod tests {
             .unwrap()
             .next()
             .unwrap();
-        let stmt = into_method(parsed.into_inner());
+        let stmt = into_method(parsed);
+        assert_eq!(stmt.range, Range { start: 0, end: 59 });
         assert_eq!("MyMethod", partial_text(&input, &stmt.name));
         let params = &stmt.params;
         assert_eq!(2, params.len());
@@ -838,7 +898,8 @@ mod tests {
             .unwrap()
             .next()
             .unwrap();
-        let stmt = into_method(parsed.into_inner());
+        let stmt = into_method(parsed);
+        assert_eq!(stmt.range, Range { start: 0, end: 12 });
         assert_eq!("MyMethod2", partial_text(&input, &stmt.name));
         assert_eq!(0, stmt.params.len());
         assert!(stmt.response.is_none());
@@ -848,7 +909,8 @@ mod tests {
             .unwrap()
             .next()
             .unwrap();
-        let stmt = into_method(parsed.into_inner());
+        let stmt = into_method(parsed);
+        assert_eq!(stmt.range, Range { start: 0, end: 39 });
         assert_eq!("MyMethod3", partial_text(&input, &stmt.name));
         assert_eq!(1, stmt.params.len());
         let params = &stmt.params;
@@ -870,7 +932,8 @@ mod tests {
             .unwrap()
             .next()
             .unwrap();
-        let stmt = into_struct(parsed.into_inner());
+        let stmt = into_struct(parsed);
+        assert_eq!(stmt.range, Range { start: 0, end: 173 });
         assert_eq!("MyStruct", partial_text(&input, &stmt.name));
         let members = &stmt.members;
         assert_eq!(4, members.len());
@@ -904,7 +967,8 @@ mod tests {
             .unwrap()
             .next()
             .unwrap();
-        let stmt = into_struct(parsed.into_inner());
+        let stmt = into_struct(parsed);
+        assert_eq!(stmt.range, Range { start: 0, end: 25 });
         assert_eq!("MyStruct", partial_text(&input, &stmt.name));
         assert_eq!(0, stmt.members.len());
     }
@@ -919,7 +983,8 @@ mod tests {
             .unwrap()
             .next()
             .unwrap();
-        let intr = into_interface(parsed.into_inner());
+        let intr = into_interface(parsed);
+        assert_eq!(intr.range, Range { start: 0, end: 112 });
         assert_eq!("MyInterface", partial_text(&input, &intr.name));
         let members = &intr.members;
         assert_eq!(2, members.len());
@@ -948,7 +1013,8 @@ mod tests {
             .unwrap()
             .next()
             .unwrap();
-        let stmt = into_union(parsed.into_inner());
+        let stmt = into_union(parsed);
+        assert_eq!(stmt.range, Range { start: 0, end: 122 });
         assert_eq!("MyUnion", partial_text(&input, &stmt.name));
         let fields = &stmt.fields;
         assert_eq!(3, fields.len());

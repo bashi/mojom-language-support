@@ -16,6 +16,7 @@
 #[grammar = "syntax/mojom.pest"]
 pub(crate) struct MojomParser;
 
+pub(crate) type Pair<'a> = pest::iterators::Pair<'a, Rule>;
 pub(crate) type Pairs<'a> = pest::iterators::Pairs<'a, Rule>;
 
 pub(crate) fn consume_token(rule: Rule, pairs: &mut Pairs) {
