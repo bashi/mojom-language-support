@@ -22,6 +22,12 @@ pub struct Range {
     pub end: usize,
 }
 
+impl Range {
+    pub fn contains(&self, offset: usize) -> bool {
+        self.start <= offset && self.end > offset
+    }
+}
+
 impl<'a> From<Span<'a>> for Range {
     fn from(span: Span<'a>) -> Range {
         Range {

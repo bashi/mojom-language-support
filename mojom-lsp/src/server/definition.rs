@@ -12,19 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use lsp_types::{Location, Position, Range};
+use lsp_types::Location;
 
 use crate::syntax::{self, preorder, Traversal};
 
 use super::mojomast::MojomAst;
-
-pub(crate) fn create_lsp_range(ast: &MojomAst, field: &syntax::Range) -> Range {
-    let pos = ast.line_col(field.start);
-    let start = Position::new(pos.line as u32, pos.col as u32);
-    let pos = ast.line_col(field.end);
-    let end = Position::new(pos.line as u32, pos.col as u32);
-    Range::new(start, end)
-}
 
 fn match_field<'a, 'b, 'c>(
     target: &'a str,
@@ -37,7 +29,7 @@ fn match_field<'a, 'b, 'c>(
     let ident = path.join(".");
     path.pop();
     if ident == target {
-        let range = create_lsp_range(ast, field);
+        let range = ast.lsp_range(field);
         return Some(Location::new(ast.uri.clone(), range));
     }
     None

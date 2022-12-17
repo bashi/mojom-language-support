@@ -20,7 +20,6 @@ use lsp_types::{Location, Range, Url};
 
 use crate::syntax::{self, preorder, Traversal};
 
-use super::definition::create_lsp_range;
 use super::mojomast::MojomAst;
 use super::semantic;
 
@@ -113,7 +112,7 @@ fn add_definition<'a, 'b, 'c>(
     path.push(name);
     let ident = path.join(".");
     path.pop();
-    let range = create_lsp_range(&ast, field);
+    let range = ast.lsp_range(field);
     definitions.push(ImportDefinition {
         ident: ident,
         range: range,
@@ -174,11 +173,6 @@ fn parse_imported<P: AsRef<Path>>(path: P) -> ImportResult {
 mod tests {
     use super::*;
 
-    fn create_uri<P: AsRef<Path>>(path: P) -> Url {
-        let path = path.as_ref().canonicalize().unwrap();
-        Url::from_file_path(path).unwrap()
-    }
-
     #[test]
     fn test_parse_imported() {
         let res = parse_imported("testdata/my_interface.mojom");
@@ -188,16 +182,10 @@ mod tests {
     #[test]
     fn test_check_imports() {
         let root_path = "testdata";
-        let file_path = "testdata/my_service.mojom";
-        let mut text = String::new();
-        File::open(&file_path)
-            .unwrap()
-            .read_to_string(&mut text)
-            .unwrap();
-        let uri = create_uri(&file_path);
-        let mojom = syntax::parse(&text).unwrap();
-        let analytics = semantic::check_semantics(&text, &mojom);
-        let ast = MojomAst::from_mojom(uri, text, mojom, analytics.module);
+        let file_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata")
+            .join("my_service.mojom");
+        let ast = MojomAst::from_path(&file_path).unwrap();
 
         let imports = check_imports(&root_path, &ast);
 

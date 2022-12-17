@@ -234,7 +234,7 @@ fn publish_diagnostics(msg_sender: &MessageSender, params: lsp_types::PublishDia
     msg_sender.send_notification(msg);
 }
 
-fn get_offset_from_position(text: &str, pos: &lsp_types::Position) -> usize {
+pub(crate) fn get_offset_from_position(text: &str, pos: &lsp_types::Position) -> usize {
     let pos_line = pos.line as usize;
     let pos_col = pos.character as usize;
     let mut offset = 0;
