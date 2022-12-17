@@ -244,7 +244,7 @@ where
         let message = read_message(&mut reader)?;
         match message {
             Message::Request(request) => handle_request(&mut ctx, request)?,
-            Message::Notofication(notification) => handle_notification(&mut ctx, notification)?,
+            Message::Notification(notification) => handle_notification(&mut ctx, notification)?,
             _ => unreachable!(),
         };
 

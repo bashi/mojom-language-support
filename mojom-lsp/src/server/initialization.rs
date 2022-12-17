@@ -98,7 +98,7 @@ pub(crate) fn initialize(
 
     let message = read_message(reader)?;
     match message {
-        Message::Notofication(notif) => {
+        Message::Notification(notif) => {
             if notif.method != lsp_types::notification::Initialized::METHOD {
                 let error_message =
                     anyhow!("Expected initialized message but got {:?}", notif.method);

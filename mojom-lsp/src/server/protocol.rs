@@ -23,7 +23,7 @@ use serde_json::{from_slice, Value};
 pub(crate) enum Message {
     Request(RequestMessage),
     Response(ResponseMessage),
-    Notofication(NotificationMessage),
+    Notification(NotificationMessage),
 }
 
 impl Message {
