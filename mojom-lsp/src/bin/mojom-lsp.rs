@@ -12,20 +12,58 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::path::PathBuf;
+
 use clap::Parser;
 
 #[derive(Parser)]
 #[command(version)]
-struct Args {}
+struct Args {
+    /// Specify log level: off, error, warn, info, debug, trace.
+    #[arg(long)]
+    log_level: Option<log::Level>,
+    /// Specify chromium out directory.
+    #[arg(long, default_value = "out/Release")]
+    out_dir: PathBuf,
+    /// Enable clangd for C++ bindings symbol lookup.
+    #[arg(long)]
+    enable_clangd: bool,
+    /// Specify a path to clangd binary.
+    #[arg(long, default_value = "clangd")]
+    clangd_path: PathBuf,
+    /// Specify a path to look for compile_commands.json.
+    #[arg(long)]
+    clangd_compile_commands_dir: Option<PathBuf>,
+}
 
 pub fn main() -> anyhow::Result<()> {
-    // For help/version information. There is no option now.
-    let _ = Args::parse();
+    let args = Args::parse();
 
-    env_logger::init();
+    // Initialize logger.
+    {
+        let mut builder = env_logger::builder();
+        builder.target(env_logger::Target::Stderr).default_format();
+        if let Some(level) = args.log_level {
+            builder.filter_level(level.to_level_filter());
+        }
+        builder.init();
+    }
 
-    let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
-    let exit_code = mojom_lsp::server::start(stdin, stdout)?;
+    let clangd_params = if args.enable_clangd {
+        Some(mojom_lsp::server::ClangdParams {
+            clangd_path: args.clangd_path,
+            out_dir: args.out_dir,
+            compile_commands_dir: args.clangd_compile_commands_dir,
+        })
+    } else {
+        None
+    };
+    let options = mojom_lsp::server::ServerStartParams {
+        reader: std::io::stdin(),
+        writer: std::io::stdout(),
+        clangd_params,
+    };
+
+    let exit_code = mojom_lsp::server::start(options)?;
     std::process::exit(exit_code);
 }

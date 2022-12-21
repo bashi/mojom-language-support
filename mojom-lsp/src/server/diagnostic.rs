@@ -23,6 +23,7 @@ use lsp_types::Url as Uri;
 
 use crate::syntax;
 
+use super::clangd::Clangd;
 use super::imported_files::{check_imports, ImportedFiles};
 use super::messagesender::MessageSender;
 use super::mojomast::MojomAst;
@@ -51,10 +52,16 @@ enum DiagnosticMessage {
             Sender<Option<lsp_types::Location>>,
         ),
     ),
+    GotoImplementation(
+        (
+            lsp_types::request::GotoImplementationParams,
+            Sender<anyhow::Result<Option<lsp_types::request::GotoImplementationResponse>>>,
+        ),
+    ),
 }
 
 pub(crate) struct DiagnosticsThread {
-    handle: JoinHandle<()>,
+    handle: JoinHandle<anyhow::Result<()>>,
     sender: Sender<DiagnosticMessage>,
 }
 
@@ -82,29 +89,53 @@ impl DiagnosticsThread {
         let loc = loc_receiver.recv().unwrap();
         loc
     }
+
+    pub(crate) fn goto_implementation(
+        &self,
+        params: lsp_types::request::GotoImplementationParams,
+    ) -> anyhow::Result<Option<lsp_types::request::GotoImplementationResponse>> {
+        let (sender, receiver) = channel();
+        self.sender
+            .send(DiagnosticMessage::GotoImplementation((params, sender)))
+            .unwrap();
+        let response = receiver.recv().unwrap();
+        response
+    }
 }
 
 pub(crate) fn start_diagnostics_thread(
     root_path: PathBuf,
     msg_sender: MessageSender,
+    clangd: Option<Clangd>,
 ) -> DiagnosticsThread {
-    let mut diag = Diagnostic::new(root_path, msg_sender);
+    let mut diag = Diagnostic::new(root_path, msg_sender, clangd);
     let (sender, receiver) = channel::<DiagnosticMessage>();
-    let handle = thread::spawn(move || loop {
-        let msg = match receiver.recv() {
-            Ok(msg) => msg,
-            Err(_) => break,
-        };
+    let handle = thread::spawn(move || {
+        loop {
+            let msg = match receiver.recv() {
+                Ok(msg) => msg,
+                Err(_) => break,
+            };
 
-        match msg {
-            DiagnosticMessage::CheckSyntax((uri, text)) => {
-                diag.check(uri, text);
-            }
-            DiagnosticMessage::GotoDefinition((uri, pos, loc_sender)) => {
-                let loc = diag.find_definition(uri, pos);
-                loc_sender.send(loc).unwrap();
+            match msg {
+                DiagnosticMessage::CheckSyntax((uri, text)) => {
+                    diag.check(uri, text);
+                }
+                DiagnosticMessage::GotoDefinition((uri, pos, loc_sender)) => {
+                    let loc = diag.find_definition(uri, pos);
+                    loc_sender.send(loc).unwrap();
+                }
+                DiagnosticMessage::GotoImplementation((params, sender)) => {
+                    let response = diag.goto_implementation(params);
+                    sender.send(response).unwrap();
+                }
             }
         }
+        if let Some(clangd) = diag.clangd {
+            clangd.terminate()?;
+        }
+
+        Ok(())
     });
 
     DiagnosticsThread {
@@ -119,6 +150,8 @@ struct Diagnostic {
     // A message sender. It is used in the diagnostics thread to send
     // notifications.
     msg_sender: MessageSender,
+    // A clangd client for goto implementation.
+    clangd: Option<Clangd>,
     // Current parsed syntax tree with the original text.
     ast: Option<MojomAst>,
     // Parsed mojom files that are imported from the current document.
@@ -126,10 +159,11 @@ struct Diagnostic {
 }
 
 impl Diagnostic {
-    fn new(root_path: PathBuf, msg_sender: MessageSender) -> Self {
+    fn new(root_path: PathBuf, msg_sender: MessageSender, clangd: Option<Clangd>) -> Self {
         Diagnostic {
             root_path: root_path,
             msg_sender: msg_sender,
+            clangd,
             ast: None,
             imported_files: None,
         }
@@ -215,6 +249,33 @@ impl Diagnostic {
             let imported_files = check_imports(&self.root_path, ast);
             self.imported_files = Some(imported_files);
         }
+    }
+
+    fn goto_implementation(
+        &mut self,
+        params: lsp_types::request::GotoImplementationParams,
+    ) -> anyhow::Result<Option<lsp_types::request::GotoImplementationResponse>> {
+        let uri = &params.text_document_position_params.text_document.uri;
+        if !self.is_same_uri(uri) {
+            self.open(uri.clone())?;
+        }
+
+        let ast = match self.ast.as_ref() {
+            Some(ast) => ast,
+            None => return Ok(None),
+        };
+        let symbol =
+            match ast.find_symbol_from_position(&params.text_document_position_params.position) {
+                Some(symbols) => symbols,
+                None => return Ok(None),
+            };
+
+        let clangd = match self.clangd.as_mut() {
+            Some(clangd) => clangd,
+            None => return Ok(None),
+        };
+        let response = clangd.goto_implementation(params, symbol)?;
+        Ok(response)
     }
 }
 

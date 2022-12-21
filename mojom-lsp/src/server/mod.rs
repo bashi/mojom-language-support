@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod asyncrpc;
+mod clangd;
 mod definition;
 mod diagnostic;
 mod imported_files;
@@ -22,4 +24,5 @@ mod protocol;
 mod semantic;
 mod server;
 
-pub use server::start;
+pub use clangd::ClangdParams;
+pub use server::{start, ServerStartParams};

@@ -38,7 +38,7 @@ fn create_server_capabilities() -> lsp_types::ServerCapabilities {
         signature_help_provider: None,
         definition_provider: Some(lsp_types::OneOf::Left(true)),
         type_definition_provider: None,
-        implementation_provider: None,
+        implementation_provider: Some(lsp_types::ImplementationProviderCapability::Simple(true)),
         references_provider: None,
         document_highlight_provider: None,
         document_symbol_provider: None,

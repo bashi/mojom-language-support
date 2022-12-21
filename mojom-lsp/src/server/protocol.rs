@@ -50,10 +50,10 @@ pub(crate) struct ResponseMessage {
 
 #[derive(Serialize)]
 pub(crate) struct JsonRpcRequestMessage<'a> {
-    jsonrpc: &'a str,
-    id: u64,
-    method: &'a str,
-    params: Value,
+    pub jsonrpc: &'a str,
+    pub id: u64,
+    pub method: &'a str,
+    pub params: Value,
 }
 
 #[allow(unused)]
@@ -136,7 +136,7 @@ pub(crate) struct NotificationMessage {
 
 // https://microsoft.github.io/language-server-protocol/specification#header-part
 #[derive(Debug)]
-struct Header {
+pub(crate) struct Header {
     pub content_length: usize,
 }
 
@@ -191,8 +191,8 @@ pub(crate) fn read_message(reader: &mut impl io::BufRead) -> anyhow::Result<Mess
 
 #[derive(Serialize)]
 struct JsonRpcResponseMessage<'a> {
-    jsonrpc: &'a str,
-    id: u64,
+    pub jsonrpc: &'a str,
+    pub id: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -250,10 +250,10 @@ pub(crate) fn write_error_response(
 }
 
 #[derive(Serialize)]
-struct JsonRpcNotificationMessage<'a> {
-    jsonrpc: &'a str,
-    method: &'a str,
-    params: Value,
+pub(crate) struct JsonRpcNotificationMessage<'a> {
+    pub jsonrpc: &'a str,
+    pub method: &'a str,
+    pub params: Value,
 }
 
 pub(crate) fn write_notification(

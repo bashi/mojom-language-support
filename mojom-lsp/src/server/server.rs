@@ -21,6 +21,7 @@ use super::protocol::{
     read_message, ErrorCodes, Message, NotificationMessage, RequestMessage, ResponseError,
 };
 
+use super::clangd::{self, ClangdParams};
 use super::diagnostic::{start_diagnostics_thread, DiagnosticsThread};
 use super::messagesender::{start_message_sender_thread, MessageSender};
 
@@ -44,8 +45,8 @@ impl ServerContext {
     fn new(msg_sender: MessageSender, diag: DiagnosticsThread) -> ServerContext {
         ServerContext {
             state: State::Initialized,
-            msg_sender: msg_sender,
-            diag: diag,
+            msg_sender,
+            diag,
             exit_code: None,
         }
     }
@@ -77,6 +78,8 @@ fn handle_request(ctx: &mut ServerContext, msg: RequestMessage) -> anyhow::Resul
         Shutdown::METHOD => shutdown_request(ctx),
         GotoDefinition::METHOD => get_request_params(msg.params)
             .and_then(|params| goto_definition_request(&mut ctx.diag, params)),
+        GotoImplementation::METHOD => get_request_params(msg.params)
+            .and_then(|params| goto_implementation_request(ctx, params)),
         _ => unimplemented_request(id, method),
     };
     match res {
@@ -122,6 +125,21 @@ fn goto_definition_request(
         return Ok(res);
     }
     return Ok(Value::Null);
+}
+
+fn goto_implementation_request(
+    ctx: &mut ServerContext,
+    params: lsp_types::request::GotoImplementationParams,
+) -> RequestResult {
+    let response = ctx.diag.goto_implementation(params);
+    match response {
+        Ok(Some(response)) => Ok(serde_json::to_value(response).unwrap()),
+        Ok(None) => Ok(Value::Null),
+        Err(err) => Err(ResponseError::new(
+            ErrorCodes::InternalError,
+            err.to_string(),
+        )),
+    }
 }
 
 // Notifications
@@ -223,21 +241,39 @@ fn get_root_path(params: &lsp_types::InitializeParams) -> Option<PathBuf> {
     Some(path)
 }
 
-// Returns exit code.
-pub fn start<R, W>(reader: R, writer: W) -> anyhow::Result<i32>
+pub struct ServerStartParams<R, W>
 where
     R: Read,
     W: Write + Send + 'static,
 {
-    let mut reader = BufReader::new(reader);
-    let mut writer = BufWriter::new(writer);
+    pub reader: R,
+    pub writer: W,
+    pub clangd_params: Option<ClangdParams>,
+}
+
+// Returns exit code.
+pub fn start<R, W>(mut options: ServerStartParams<R, W>) -> anyhow::Result<i32>
+where
+    R: Read,
+    W: Write + Send + 'static,
+{
+    let mut reader = BufReader::new(options.reader);
+    let mut writer = BufWriter::new(options.writer);
 
     let params = super::initialization::initialize(&mut reader, &mut writer)?;
 
     let root_path = get_root_path(&params).unwrap_or(PathBuf::new());
+    if root_path.exists() {
+        std::env::set_current_dir(&root_path)?;
+    }
+
+    let clangd = match options.clangd_params.take() {
+        Some(params) => Some(clangd::start(root_path.clone(), params)?),
+        None => None,
+    };
 
     let msg_sender_thread = start_message_sender_thread(writer);
-    let diag = start_diagnostics_thread(root_path, msg_sender_thread.get_sender());
+    let diag = start_diagnostics_thread(root_path, msg_sender_thread.get_sender(), clangd);
 
     let mut ctx = ServerContext::new(msg_sender_thread.get_sender(), diag);
     loop {
@@ -290,8 +326,13 @@ mod tests {
         let params = serde_json::to_value(&params).unwrap();
 
         let (r, w) = pipe();
+        let options = ServerStartParams {
+            reader,
+            writer: w,
+            clangd_params: None,
+        };
         let handle = std::thread::spawn(move || {
-            let status = start(reader, w);
+            let status = start(options);
             status
         });
 
