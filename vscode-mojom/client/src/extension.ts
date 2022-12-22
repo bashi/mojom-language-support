@@ -23,20 +23,28 @@ import {
   LanguageClientOptions,
   Executable,
   State,
+  RevealOutputChannelOn,
 } from "vscode-languageclient/node";
 
 const DEFAULT_SERVER_COMMAND = "mojom-lsp";
 
 let client: LanguageClient | null = null;
 let lspStatusBarItem: vscode.StatusBarItem;
+let outputChannel: vscode.OutputChannel;
 
-function startClient(serverPath: string) {
+function startClient(configuration: vscode.WorkspaceConfiguration) {
+  const command = getServerPath(configuration);
+  const rawArgs = configuration.get<string[]>("languageServerArguments") || [];
+  const args = rawArgs.map((arg) => substituteVariableReferences(arg));
   const serverOptions: Executable = {
-    command: serverPath,
+    command,
+    args,
   };
 
   const clientOptions: LanguageClientOptions = {
     documentSelector: [{ scheme: "file", language: "mojom" }],
+    outputChannel,
+    revealOutputChannelOn: RevealOutputChannelOn.Never,
   };
 
   client = new LanguageClient(
@@ -163,8 +171,7 @@ async function tryToInstallLanguageServer(
   if (selected === "Yes") {
     const installed = await installServerBinary();
     if (installed) {
-      const serverPath = getServerPath(configuration);
-      startClient(serverPath);
+      startClient(configuration);
     } else {
       configuration.update("enableLanguageServer", "Disabled");
     }
@@ -179,7 +186,7 @@ async function applyConfigurations() {
   const enableLanguageServer = configuration.get<string>("enableLanguageServer");
   const shouldStartClient = (enableLanguageServer === "Enabled") && (await hasCommand(serverPath));
   if (shouldStartClient) {
-    startClient(serverPath);
+    startClient(configuration);
   } else if (enableLanguageServer === "Enabled" && serverPath === DEFAULT_SERVER_COMMAND) {
     tryToInstallLanguageServer(configuration);
   } else if (enableLanguageServer !== "Enabled") {
@@ -217,6 +224,9 @@ export async function activate(context: vscode.ExtensionContext) {
   subscriptions.push(vscode.commands.registerCommand('mojom.installLanguageServer', async () => {
     installServerBinary();
   }));
+
+  outputChannel = vscode.window.createOutputChannel("Mojom Language Server");
+  subscriptions.push(outputChannel);
 
   applyConfigurations();
 }

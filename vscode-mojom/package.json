@@ -56,7 +56,16 @@
         },
         "mojom.languageServerPath": {
           "type": "string",
-          "default": "mojom-lsp"
+          "default": "mojom-lsp",
+          "description": "The path to Mojom Language Server executable."
+        },
+        "mojom.languageServerArguments": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "description": "Arguments for Mojom Language Server."
         }
       }
     },
