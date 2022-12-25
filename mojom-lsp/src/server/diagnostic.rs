@@ -26,7 +26,7 @@ use crate::syntax;
 use super::clangd::Clangd;
 use super::imported_files::{check_imports, ImportedFiles};
 use super::messagesender::MessageSender;
-use super::mojomast::MojomAst;
+use super::mojomast::{DocumentSymbol, MojomAst};
 use super::protocol::NotificationMessage;
 
 pub(crate) fn create_diagnostic(range: lsp_types::Range, message: String) -> lsp_types::Diagnostic {
@@ -57,6 +57,12 @@ enum DiagnosticMessage {
         (
             lsp_types::request::GotoImplementationParams,
             Sender<anyhow::Result<Option<lsp_types::request::GotoImplementationResponse>>>,
+        ),
+    ),
+    FindReferences(
+        (
+            lsp_types::ReferenceParams,
+            Sender<anyhow::Result<Option<Vec<lsp_types::Location>>>>,
         ),
     ),
 }
@@ -108,6 +114,18 @@ impl DiagnosticsThread {
         let response = receiver.recv().unwrap();
         response
     }
+
+    pub(crate) fn find_references(
+        &self,
+        params: lsp_types::ReferenceParams,
+    ) -> anyhow::Result<Option<Vec<lsp_types::Location>>> {
+        let (sender, receiver) = channel();
+        self.sender
+            .send(DiagnosticMessage::FindReferences((params, sender)))
+            .unwrap();
+        let response = receiver.recv().unwrap();
+        response
+    }
 }
 
 pub(crate) fn start_diagnostics_thread(
@@ -137,6 +155,10 @@ pub(crate) fn start_diagnostics_thread(
                 }
                 DiagnosticMessage::GotoImplementation((params, sender)) => {
                     let response = diag.goto_implementation(params);
+                    sender.send(response).unwrap();
+                }
+                DiagnosticMessage::FindReferences((params, sender)) => {
+                    let response = diag.find_references(params);
                     sender.send(response).unwrap();
                 }
             }
@@ -269,11 +291,11 @@ impl Diagnostic {
         }
     }
 
-    fn goto_implementation(
+    fn find_symbol(
         &mut self,
-        params: lsp_types::request::GotoImplementationParams,
-    ) -> anyhow::Result<Option<lsp_types::request::GotoImplementationResponse>> {
-        let uri = &params.text_document_position_params.text_document.uri;
+        params: &lsp_types::TextDocumentPositionParams,
+    ) -> anyhow::Result<Option<DocumentSymbol>> {
+        let uri = &params.text_document.uri;
         if !self.is_same_uri(uri) {
             self.open(uri.clone())?;
         }
@@ -282,17 +304,50 @@ impl Diagnostic {
             Some(ast) => ast,
             None => return Ok(None),
         };
-        let symbol =
-            match ast.find_symbol_from_position(&params.text_document_position_params.position) {
-                Some(symbols) => symbols,
-                None => return Ok(None),
-            };
+        let symbol = match ast.find_symbol_from_position(&params.position) {
+            Some(symbols) => symbols,
+            None => return Ok(None),
+        };
+        Ok(Some(symbol))
+    }
 
+    fn goto_implementation(
+        &mut self,
+        params: lsp_types::request::GotoImplementationParams,
+    ) -> anyhow::Result<Option<lsp_types::request::GotoImplementationResponse>> {
+        let symbol = match self.find_symbol(&params.text_document_position_params)? {
+            Some(symbol) => symbol,
+            None => return Ok(None),
+        };
         let clangd = match self.clangd.as_mut() {
             Some(clangd) => clangd,
             None => return Ok(None),
         };
         let response = clangd.goto_implementation(params, symbol)?;
+        Ok(response)
+    }
+
+    fn find_references(
+        &mut self,
+        params: lsp_types::ReferenceParams,
+    ) -> anyhow::Result<Option<Vec<lsp_types::Location>>> {
+        let mut symbol = match self.find_symbol(&params.text_document_position)? {
+            Some(symbol) => symbol,
+            None => return Ok(None),
+        };
+
+        let clangd = match self.clangd.as_mut() {
+            Some(clangd) => clangd,
+            None => return Ok(None),
+        };
+
+        // Use Proxy for references.
+        match &mut symbol {
+            DocumentSymbol::Interface(ref mut interface) => interface.name += "Proxy",
+            DocumentSymbol::Method(ref mut method) => method.interface_name += "Proxy",
+        }
+
+        let response = clangd.find_references(params, symbol)?;
         Ok(response)
     }
 }

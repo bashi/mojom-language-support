@@ -26,13 +26,14 @@ use tokio::runtime::Runtime;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
 use super::asyncrpc::{recv_message, send_notification, send_request};
-use super::mojomast::DocumentSymbol;
+use super::mojomast::{DocumentSymbol, InterfaceSymbol, MethodSymbol};
 use super::protocol::{Message, ResponseMessage};
 
 pub struct ClangdParams {
     pub clangd_path: PathBuf,
     pub out_dir: PathBuf,
     pub compile_commands_dir: Option<PathBuf>,
+    pub log_level: Option<log::Level>,
 }
 
 pub(crate) struct Clangd {
@@ -62,6 +63,18 @@ impl Clangd {
             inner.goto_implementation(params, target_symbol).await
         })
     }
+
+    pub(crate) fn find_references(
+        &mut self,
+        params: lsp_types::ReferenceParams,
+        target_symbol: DocumentSymbol,
+    ) -> anyhow::Result<Option<Vec<lsp_types::Location>>> {
+        let inner = self.inner.clone();
+        self.rt.block_on(async {
+            let mut inner = inner.lock().unwrap();
+            inner.find_references(params, target_symbol).await
+        })
+    }
 }
 
 struct CppBindingHeader {
@@ -70,158 +83,29 @@ struct CppBindingHeader {
 }
 
 impl CppBindingHeader {
-    fn create_goto_implementation_params(
+    async fn goto_implementation<W>(
         &self,
+        transport: &mut Transport<W>,
         target_symbol: &DocumentSymbol,
-    ) -> Option<request::GotoImplementationParams> {
-        let symbol = match self.symbols.iter().find(|symbol| {
-            target_symbol.is_lsp_kind(symbol.kind) && target_symbol.name() == symbol.name
-        }) {
-            Some(symbol) => symbol,
-            None => return None,
-        };
+    ) -> anyhow::Result<Option<Vec<lsp_types::Location>>>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let text_document_position_params =
+            match self.create_text_document_position_params(target_symbol) {
+                Some(params) => params,
+                None => return Ok(None),
+            };
 
-        let text_document = self.text_document.clone();
-        let position = symbol.location.range.start;
-
-        Some(request::GotoImplementationParams {
-            text_document_position_params: lsp_types::TextDocumentPositionParams {
-                text_document,
-                position,
-            },
+        let params = request::GotoImplementationParams {
+            text_document_position_params,
             work_done_progress_params: Default::default(),
             partial_result_params: Default::default(),
-        })
-    }
-}
-
-struct CppBindings {
-    mojom_uri: Url,
-    non_blink: CppBindingHeader,
-    blink: CppBindingHeader,
-}
-
-struct Inner {
-    root_path: PathBuf,
-    gen_path: PathBuf,
-
-    child: Child,
-    stdin: ChildStdin,
-    next_message_id: u64,
-
-    receiver: Receiver<Message>,
-
-    bindings: Option<CppBindings>,
-}
-
-impl Inner {
-    async fn ensure_binding_headers(&mut self, mojom_uri: &Url) -> anyhow::Result<()> {
-        if let Some(cached) = self.bindings.as_ref() {
-            if &cached.mojom_uri == mojom_uri {
-                return Ok(());
-            }
-            self.drop_binding_headers().await?;
-        }
-
-        let base_path = {
-            let root_path = self.root_path.to_str().unwrap();
-            let out_path = self.gen_path.to_str().unwrap();
-            mojom_uri.path().replace(root_path, out_path)
         };
-
-        let mojom_uri = mojom_uri.clone();
-        let non_blink = self.open_header(base_path.clone() + ".h").await?;
-        let blink = self.open_header(base_path + "-blink.h").await?;
-        self.bindings = Some(CppBindings {
-            mojom_uri,
-            non_blink,
-            blink,
-        });
-        Ok(())
-    }
-
-    async fn open_header(&mut self, path: impl AsRef<Path>) -> anyhow::Result<CppBindingHeader> {
-        let uri = Url::from_file_path(path)
-            .map_err(|err| anyhow::anyhow!("Failed to convert file: {:?}", err))?;
-
-        // Open document.
-        let text_document_item = {
-            let path = uri
-                .to_file_path()
-                .map_err(|err| anyhow::anyhow!("{:?}", err))?;
-            let text = tokio::fs::read_to_string(path).await?;
-            lsp_types::TextDocumentItem {
-                uri: uri.clone(),
-                language_id: "cpp".to_string(),
-                version: 1,
-                text,
-            }
-        };
-        self.send_notification(
-            notification::DidOpenTextDocument::METHOD,
-            &lsp_types::DidOpenTextDocumentParams {
-                text_document: text_document_item.clone(),
-            },
-        )
-        .await?;
-
-        // Get symbols.
-        let text_document = lsp_types::TextDocumentIdentifier::new(uri.clone());
-        self.send_request(
-            request::DocumentSymbolRequest::METHOD,
-            &lsp_types::DocumentSymbolParams {
-                text_document: text_document.clone(),
-                work_done_progress_params: Default::default(),
-                partial_result_params: Default::default(),
-            },
-        )
-        .await?;
-        let response = self
-            .recv_response_or_null::<lsp_types::DocumentSymbolResponse>()
+        transport
+            .send_request(request::GotoImplementation::METHOD, &params)
             .await?;
-        let symbols = match response {
-            Some(lsp_types::DocumentSymbolResponse::Flat(symbols)) => symbols,
-            Some(lsp_types::DocumentSymbolResponse::Nested(_)) => unimplemented!(),
-            None => vec![],
-        };
-
-        Ok(CppBindingHeader {
-            text_document,
-            symbols,
-        })
-    }
-
-    async fn drop_binding_headers(&mut self) -> anyhow::Result<()> {
-        let cached = match self.bindings.take() {
-            Some(cached) => cached,
-            None => return Ok(()),
-        };
-
-        self.send_notification(
-            notification::DidCloseTextDocument::METHOD,
-            &lsp_types::DidCloseTextDocumentParams {
-                text_document: cached.non_blink.text_document,
-            },
-        )
-        .await?;
-        self.send_notification(
-            notification::DidCloseTextDocument::METHOD,
-            &lsp_types::DidCloseTextDocumentParams {
-                text_document: cached.blink.text_document,
-            },
-        )
-        .await?;
-
-        Ok(())
-    }
-
-    async fn get_implementation_from_clangd(
-        &mut self,
-        params: request::GotoImplementationParams,
-    ) -> anyhow::Result<Option<Vec<lsp_types::Location>>> {
-        self.send_request(request::GotoImplementation::METHOD, &params)
-            .await?;
-        let response = match self
+        let response = match transport
             .recv_response_or_null::<request::GotoImplementationResponse>()
             .await?
         {
@@ -230,10 +114,6 @@ impl Inner {
         };
 
         // Filter mojom-generated implementations.
-        let is_mojom_generated = |uri: &Url| {
-            let path = uri.path();
-            path.contains("/gen/") && path.contains("mojom")
-        };
         let locations = match response {
             request::GotoImplementationResponse::Array(mut locations) => {
                 locations.retain(|location| !is_mojom_generated(&location.uri));
@@ -252,49 +132,216 @@ impl Inner {
         Ok(Some(locations))
     }
 
-    async fn goto_implementation(
-        &mut self,
-        params: request::GotoImplementationParams,
-        target_symbol: DocumentSymbol,
-    ) -> anyhow::Result<Option<request::GotoImplementationResponse>> {
-        self.ensure_binding_headers(&params.text_document_position_params.text_document.uri)
+    async fn find_references<W>(
+        &self,
+        transport: &mut Transport<W>,
+        target_symbol: &DocumentSymbol,
+    ) -> anyhow::Result<Option<Vec<lsp_types::Location>>>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let text_document_position = match self.create_text_document_position_params(target_symbol)
+        {
+            Some(position) => position,
+            None => return Ok(None),
+        };
+        let params = lsp_types::ReferenceParams {
+            text_document_position,
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: lsp_types::ReferenceContext {
+                include_declaration: false,
+            },
+        };
+
+        transport
+            .send_request(request::References::METHOD, &params)
             .await?;
-        // Get non-blink implementation.
-        let bindings = &self.bindings.as_ref().unwrap().non_blink;
-        let locations = match bindings.create_goto_implementation_params(&target_symbol) {
-            Some(params) => self.get_implementation_from_clangd(params).await?,
+        let mut response = match transport
+            .recv_response_or_null::<Vec<lsp_types::Location>>()
+            .await?
+        {
+            Some(response) => response,
             None => return Ok(None),
         };
 
-        // Get blink implementation.
-        let bindings = &self.bindings.as_ref().unwrap().blink;
-        let blink_locations = match bindings.create_goto_implementation_params(&target_symbol) {
-            Some(params) => self.get_implementation_from_clangd(params).await?,
-            None => None,
-        };
-
-        // Merge locations.
-        let locations = match (locations, blink_locations) {
-            (Some(mut a), Some(mut b)) => {
-                a.append(&mut b);
-                a
-            }
-            (Some(a), None) => a,
-            (None, Some(b)) => b,
-            (None, None) => return Ok(None),
-        };
-
-        let response = request::GotoImplementationResponse::Array(locations);
+        // Filter out mojom generated files.
+        response.retain(|location| !is_mojom_generated(&location.uri));
         Ok(Some(response))
     }
 
+    fn create_text_document_position_params(
+        &self,
+        target_symbol: &DocumentSymbol,
+    ) -> Option<lsp_types::TextDocumentPositionParams> {
+        let location = match self.find_symbol_location(target_symbol) {
+            Some(location) => location,
+            None => return None,
+        };
+
+        let text_document = self.text_document.clone();
+        let position = location.range.start;
+
+        Some(lsp_types::TextDocumentPositionParams {
+            text_document,
+            position,
+        })
+    }
+
+    fn find_interface_symbol(
+        &self,
+        interface: &InterfaceSymbol,
+    ) -> Option<lsp_types::SymbolInformation> {
+        self.symbols
+            .iter()
+            .find(|symbol| {
+                symbol.kind == lsp_types::SymbolKind::CLASS && symbol.name == interface.name
+            })
+            .cloned()
+    }
+
+    fn find_method_symbol(
+        &self,
+        method: &MethodSymbol,
+    ) -> Option<(lsp_types::SymbolInformation, lsp_types::SymbolInformation)> {
+        let mut stack: Vec<&lsp_types::SymbolInformation> = Vec::new();
+        for symbol in self.symbols.iter() {
+            while let Some(outer) = stack.last() {
+                if outer.location.range.end >= symbol.location.range.start {
+                    break;
+                }
+                stack.pop();
+            }
+
+            if symbol.kind == lsp_types::SymbolKind::CLASS {
+                stack.push(symbol);
+                continue;
+            }
+
+            if symbol.kind != lsp_types::SymbolKind::METHOD || symbol.name != method.name {
+                continue;
+            }
+
+            if let Some(interface) = stack.last() {
+                if interface.name == method.interface_name {
+                    return Some(((*interface).clone(), symbol.clone()));
+                }
+            }
+        }
+        None
+    }
+
+    fn find_symbol_location(&self, target_symbol: &DocumentSymbol) -> Option<lsp_types::Location> {
+        match target_symbol {
+            DocumentSymbol::Interface(interface) => self
+                .find_interface_symbol(&interface)
+                .map(|symbol| symbol.location),
+            DocumentSymbol::Method(method) => {
+                let method = match self.find_method_symbol(&method) {
+                    Some((_interface, method)) => method,
+                    None => return None,
+                };
+                let mut location = method.location.clone();
+                // `location` starts with the return type, not the name of the method,
+                // but clangd requires the location for the name of the method.
+                // Assume that the return type of generated methods is always `void`.
+                location.range.start.character += "void ".len() as u32;
+
+                Some(location)
+            }
+        }
+    }
+}
+
+struct CppBindings {
+    mojom_uri: Url,
+    bindings: Vec<CppBindingHeader>,
+}
+
+impl CppBindings {
+    async fn close<W>(self, transport: &mut Transport<W>) -> anyhow::Result<()>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        for binding in self.bindings {
+            transport
+                .send_notification(
+                    notification::DidCloseTextDocument::METHOD,
+                    &lsp_types::DidCloseTextDocumentParams {
+                        text_document: binding.text_document,
+                    },
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn goto_implementation<W>(
+        &self,
+        transport: &mut Transport<W>,
+        target_symbol: &DocumentSymbol,
+    ) -> anyhow::Result<Option<request::GotoImplementationResponse>>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let mut all_locations = Vec::new();
+        for binding in self.bindings.iter() {
+            if let Some(mut locations) = binding
+                .goto_implementation(transport, target_symbol)
+                .await?
+            {
+                all_locations.append(&mut locations);
+            }
+        }
+
+        if all_locations.is_empty() {
+            Ok(None)
+        } else {
+            let response = request::GotoImplementationResponse::Array(all_locations);
+            Ok(Some(response))
+        }
+    }
+
+    async fn find_references<W>(
+        &self,
+        transport: &mut Transport<W>,
+        target_symbol: &DocumentSymbol,
+    ) -> anyhow::Result<Option<Vec<lsp_types::Location>>>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let mut all_locations = Vec::new();
+        for binding in self.bindings.iter() {
+            if let Some(mut locations) = binding.find_references(transport, target_symbol).await? {
+                all_locations.append(&mut locations);
+            }
+        }
+
+        if all_locations.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(all_locations))
+        }
+    }
+}
+
+struct Transport<W> {
+    writer: W,
+    next_message_id: u64,
+    receiver: Receiver<Message>,
+}
+
+impl<W> Transport<W>
+where
+    W: AsyncWrite + Unpin,
+{
     async fn send_request<P>(&mut self, method: &str, params: &P) -> anyhow::Result<()>
     where
         P: Serialize,
     {
         let id = self.next_message_id;
         self.next_message_id = self.next_message_id.wrapping_add(1);
-        send_request(&mut self.stdin, id, method, params).await?;
+        send_request(&mut self.writer, id, method, params).await?;
         Ok(())
     }
 
@@ -302,7 +349,7 @@ impl Inner {
     where
         P: Serialize,
     {
-        send_notification(&mut self.stdin, method, params).await?;
+        send_notification(&mut self.writer, method, params).await?;
         Ok(())
     }
 
@@ -341,6 +388,139 @@ impl Inner {
     }
 }
 
+struct Inner {
+    child: Child,
+
+    root_path: PathBuf,
+    gen_path: PathBuf,
+
+    transport: Transport<ChildStdin>,
+
+    bindings: Option<CppBindings>,
+}
+
+impl Inner {
+    async fn ensure_binding_headers(&mut self, mojom_uri: &Url) -> anyhow::Result<()> {
+        if let Some(cached) = self.bindings.as_ref() {
+            if &cached.mojom_uri == mojom_uri {
+                return Ok(());
+            }
+            self.drop_binding_headers().await?;
+        }
+
+        let base_path = {
+            let root_path = self.root_path.to_str().unwrap();
+            let out_path = self.gen_path.to_str().unwrap();
+            mojom_uri.path().replace(root_path, out_path)
+        };
+
+        let mojom_uri = mojom_uri.clone();
+        let mut bindings = Vec::new();
+        if let Ok(non_blink) = self.open_header(base_path.clone() + ".h").await {
+            bindings.push(non_blink);
+        }
+        if let Ok(blink) = self.open_header(base_path + "-blink.h").await {
+            bindings.push(blink);
+        }
+        self.bindings = Some(CppBindings {
+            mojom_uri,
+            bindings,
+        });
+        Ok(())
+    }
+
+    async fn open_header(&mut self, path: impl AsRef<Path>) -> anyhow::Result<CppBindingHeader> {
+        let uri = Url::from_file_path(path)
+            .map_err(|err| anyhow::anyhow!("Failed to convert file: {:?}", err))?;
+
+        // Open document.
+        let text_document_item = {
+            let path = uri
+                .to_file_path()
+                .map_err(|err| anyhow::anyhow!("{:?}", err))?;
+            let text = tokio::fs::read_to_string(path).await?;
+            lsp_types::TextDocumentItem {
+                uri: uri.clone(),
+                language_id: "cpp".to_string(),
+                version: 1,
+                text,
+            }
+        };
+        self.transport
+            .send_notification(
+                notification::DidOpenTextDocument::METHOD,
+                &lsp_types::DidOpenTextDocumentParams {
+                    text_document: text_document_item.clone(),
+                },
+            )
+            .await?;
+
+        // Get symbols.
+        let text_document = lsp_types::TextDocumentIdentifier::new(uri.clone());
+        self.transport
+            .send_request(
+                request::DocumentSymbolRequest::METHOD,
+                &lsp_types::DocumentSymbolParams {
+                    text_document: text_document.clone(),
+                    work_done_progress_params: Default::default(),
+                    partial_result_params: Default::default(),
+                },
+            )
+            .await?;
+        let response = self
+            .transport
+            .recv_response_or_null::<lsp_types::DocumentSymbolResponse>()
+            .await?;
+        let symbols = match response {
+            Some(lsp_types::DocumentSymbolResponse::Flat(symbols)) => symbols,
+            Some(lsp_types::DocumentSymbolResponse::Nested(_)) => unimplemented!(),
+            None => vec![],
+        };
+
+        Ok(CppBindingHeader {
+            text_document,
+            symbols,
+        })
+    }
+
+    async fn drop_binding_headers(&mut self) -> anyhow::Result<()> {
+        let bindings = match self.bindings.take() {
+            Some(bindings) => bindings,
+            None => return Ok(()),
+        };
+        bindings.close(&mut self.transport).await?;
+        Ok(())
+    }
+
+    async fn goto_implementation(
+        &mut self,
+        params: request::GotoImplementationParams,
+        target_symbol: DocumentSymbol,
+    ) -> anyhow::Result<Option<request::GotoImplementationResponse>> {
+        self.ensure_binding_headers(&params.text_document_position_params.text_document.uri)
+            .await?;
+        self.bindings
+            .as_ref()
+            .unwrap()
+            .goto_implementation(&mut self.transport, &target_symbol)
+            .await
+    }
+
+    async fn find_references(
+        &mut self,
+        params: lsp_types::ReferenceParams,
+        target_symbol: DocumentSymbol,
+    ) -> anyhow::Result<Option<Vec<lsp_types::Location>>> {
+        self.ensure_binding_headers(&params.text_document_position.text_document.uri)
+            .await?;
+        self.bindings
+            .as_ref()
+            .unwrap()
+            .find_references(&mut self.transport, &target_symbol)
+            .await
+    }
+}
+
 pub(crate) fn start(root_path: PathBuf, params: ClangdParams) -> anyhow::Result<Clangd> {
     let rt = Runtime::new()?;
     let gen_path = if params.out_dir.is_absolute() {
@@ -358,21 +538,25 @@ pub(crate) fn start(root_path: PathBuf, params: ClangdParams) -> anyhow::Result<
 async fn start_impl(
     root_path: PathBuf,
     gen_path: PathBuf,
-    params: ClangdParams,
+    mut params: ClangdParams,
 ) -> anyhow::Result<Inner> {
     use std::process::Stdio;
     let mut command = Command::new(&params.clangd_path);
-    command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    command.stdin(Stdio::piped()).stdout(Stdio::piped());
+    if params.log_level.is_some() {
+        command.stderr(Stdio::piped());
+    } else {
+        command.stderr(Stdio::null());
+    }
     if let Some(dir) = params.compile_commands_dir.as_ref() {
         command.arg(format!("--compile-commands-dir={}", dir.display()));
     }
     let mut child = command.spawn()?;
 
-    let stderr = child.stderr.take().unwrap();
-    tokio::spawn(stderr_task(stderr));
+    if let Some(log_level) = params.log_level.take() {
+        let stderr = child.stderr.take().unwrap();
+        tokio::spawn(stderr_task(stderr, log_level));
+    }
 
     let mut stdin = child.stdin.take().unwrap();
     let stdout = child.stdout.take().unwrap();
@@ -382,13 +566,17 @@ async fn start_impl(
     let (sender, receiver) = mpsc::channel(64);
     tokio::spawn(reader_task(reader, sender));
 
-    Ok(Inner {
-        root_path,
-        gen_path,
-        child,
-        stdin,
+    let transport = Transport {
+        writer: stdin,
         next_message_id: 1,
         receiver,
+    };
+
+    Ok(Inner {
+        child,
+        root_path,
+        gen_path,
+        transport,
         bindings: None,
     })
 }
@@ -440,7 +628,7 @@ where
     Ok(())
 }
 
-async fn stderr_task(stderr: ChildStderr) -> anyhow::Result<()> {
+async fn stderr_task(stderr: ChildStderr, log_level: log::Level) -> anyhow::Result<()> {
     let mut lines = BufReader::new(stderr).lines();
     while let Some(line) = lines.next_line().await? {
         let first = match line.chars().next() {
@@ -448,12 +636,32 @@ async fn stderr_task(stderr: ChildStderr) -> anyhow::Result<()> {
             None => continue,
         };
         match first {
-            'E' => log::error!("{}", line),
-            'W' => log::warn!("{}", line),
-            'I' => log::info!("{}", line),
-            'D' => log::debug!("{}", line),
-            'T' => log::trace!("{}", line),
-            _ => log::debug!("{}", line),
+            'E' => {
+                if log_level <= log::Level::Error {
+                    log::error!("{}", line);
+                }
+            }
+            'W' => {
+                if log_level <= log::Level::Warn {
+                    log::warn!("{}", line);
+                }
+            }
+            'I' => {
+                if log_level <= log::Level::Info {
+                    log::info!("{}", line);
+                }
+            }
+            'D' => {
+                if log_level <= log::Level::Debug {
+                    log::debug!("{}", line);
+                }
+            }
+            'T' => {
+                if log_level <= log::Level::Trace {
+                    log::trace!("{}", line);
+                }
+            }
+            _ => (),
         }
     }
     Ok(())
@@ -467,4 +675,9 @@ where
         sender.send(message).await?;
     }
     Ok(())
+}
+
+fn is_mojom_generated(uri: &Url) -> bool {
+    let path = uri.path();
+    path.contains("/gen/") && path.contains("mojom")
 }

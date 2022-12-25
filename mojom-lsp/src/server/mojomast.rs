@@ -34,22 +34,6 @@ pub(crate) enum DocumentSymbol {
     Interface(InterfaceSymbol),
 }
 
-impl DocumentSymbol {
-    pub(crate) fn is_lsp_kind(&self, kind: lsp_types::SymbolKind) -> bool {
-        match self {
-            Self::Method(_) => kind == lsp_types::SymbolKind::METHOD,
-            Self::Interface(_) => kind == lsp_types::SymbolKind::CLASS,
-        }
-    }
-
-    pub(crate) fn name(&self) -> &str {
-        match self {
-            Self::Method(method) => &method.name,
-            Self::Interface(interface) => &interface.name,
-        }
-    }
-}
-
 #[derive(Debug)]
 pub(crate) struct MojomAst {
     pub(crate) uri: lsp_types::Url,

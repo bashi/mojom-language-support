@@ -34,6 +34,9 @@ struct Args {
     /// Specify a path to look for compile_commands.json.
     #[arg(long)]
     clangd_compile_commands_dir: Option<PathBuf>,
+    /// Specify clangd log level.
+    #[arg(long)]
+    clangd_log_level: Option<log::Level>,
 }
 
 pub fn main() -> anyhow::Result<()> {
@@ -54,6 +57,7 @@ pub fn main() -> anyhow::Result<()> {
             clangd_path: args.clangd_path,
             out_dir: args.out_dir,
             compile_commands_dir: args.clangd_compile_commands_dir,
+            log_level: args.clangd_log_level,
         })
     } else {
         None

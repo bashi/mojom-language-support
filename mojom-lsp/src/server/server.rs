@@ -80,6 +80,9 @@ fn handle_request(ctx: &mut ServerContext, msg: RequestMessage) -> anyhow::Resul
             .and_then(|params| goto_definition_request(&mut ctx.diag, params)),
         GotoImplementation::METHOD => get_request_params(msg.params)
             .and_then(|params| goto_implementation_request(ctx, params)),
+        References::METHOD => {
+            get_request_params(msg.params).and_then(|params| find_references_request(ctx, params))
+        }
         _ => unimplemented_request(id, method),
     };
     match res {
@@ -132,6 +135,21 @@ fn goto_implementation_request(
     params: lsp_types::request::GotoImplementationParams,
 ) -> RequestResult {
     let response = ctx.diag.goto_implementation(params);
+    response_to_request_result(response)
+}
+
+fn find_references_request(
+    ctx: &mut ServerContext,
+    params: lsp_types::ReferenceParams,
+) -> RequestResult {
+    let response = ctx.diag.find_references(params);
+    response_to_request_result(response)
+}
+
+fn response_to_request_result<R>(response: anyhow::Result<Option<R>>) -> RequestResult
+where
+    R: serde::Serialize,
+{
     match response {
         Ok(Some(response)) => Ok(serde_json::to_value(response).unwrap()),
         Ok(None) => Ok(Value::Null),
