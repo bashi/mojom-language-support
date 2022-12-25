@@ -45,6 +45,7 @@ pub(crate) fn create_diagnostic(range: lsp_types::Range, message: String) -> lsp
 
 enum DiagnosticMessage {
     CheckSyntax((Uri, String)),
+    DidCloseTextDocument(lsp_types::DidCloseTextDocumentParams),
     GotoDefinition(
         (
             Uri,
@@ -74,6 +75,12 @@ impl DiagnosticsThread {
     pub(crate) fn check(&self, uri: Uri, text: String) {
         self.sender
             .send(DiagnosticMessage::CheckSyntax((uri, text)))
+            .unwrap();
+    }
+
+    pub(crate) fn did_close_text_document(&self, params: lsp_types::DidCloseTextDocumentParams) {
+        self.sender
+            .send(DiagnosticMessage::DidCloseTextDocument(params))
             .unwrap();
     }
 
@@ -120,6 +127,9 @@ pub(crate) fn start_diagnostics_thread(
             match msg {
                 DiagnosticMessage::CheckSyntax((uri, text)) => {
                     diag.check(uri, text);
+                }
+                DiagnosticMessage::DidCloseTextDocument(params) => {
+                    diag.did_close_text_document(params);
                 }
                 DiagnosticMessage::GotoDefinition((uri, pos, loc_sender)) => {
                     let loc = diag.find_definition(uri, pos);
@@ -172,6 +182,14 @@ impl Diagnostic {
     fn check(&mut self, uri: Uri, text: String) {
         self.check_syntax(uri.clone(), text);
         self.check_imported_files();
+    }
+
+    fn did_close_text_document(&mut self, params: lsp_types::DidCloseTextDocumentParams) {
+        if self.is_same_uri(&params.text_document.uri) {
+            // Drop parsed results.
+            self.ast.take();
+            self.imported_files.take();
+        }
     }
 
     fn find_definition(

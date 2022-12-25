@@ -160,6 +160,9 @@ fn handle_notification(ctx: &mut ServerContext, msg: NotificationMessage) -> any
         DidChangeTextDocument::METHOD => {
             get_params(msg.params).map(|params| did_change_text_document(ctx, params))?;
         }
+        DidCloseTextDocument::METHOD => {
+            get_params(msg.params).map(|params| did_close_text_document(ctx, params))?;
+        }
         // Accept following notifications but do nothing.
         DidChangeConfiguration::METHOD => (),
         WillSaveTextDocument::METHOD => (),
@@ -197,6 +200,10 @@ fn did_change_text_document(
         .collect::<Vec<_>>();
     let text = content.join("");
     ctx.diag.check(uri, text);
+}
+
+fn did_close_text_document(ctx: &mut ServerContext, params: lsp_types::DidCloseTextDocumentParams) {
+    ctx.diag.did_close_text_document(params);
 }
 
 fn is_chromium_src_dir(path: &PathBuf) -> bool {
