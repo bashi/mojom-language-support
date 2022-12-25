@@ -167,6 +167,8 @@ fn handle_notification(ctx: &mut ServerContext, msg: NotificationMessage) -> any
         DidChangeConfiguration::METHOD => (),
         WillSaveTextDocument::METHOD => (),
         DidSaveTextDocument::METHOD => (),
+        LogTrace::METHOD => (),
+        SetTrace::METHOD => (),
         _ => {
             log::warn!("Received unimplemented notification: {:#?}", msg);
         }
