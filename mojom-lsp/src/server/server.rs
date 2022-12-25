@@ -303,26 +303,7 @@ mod tests {
     fn test_server_init() {
         let (reader, mut writer) = pipe();
 
-        let capabilities = lsp_types::ClientCapabilities {
-            workspace: None,
-            text_document: None,
-            window: None,
-            general: None,
-            experimental: None,
-        };
-        // TODO: Try to remove allow(deprecated)
-        #[allow(deprecated)]
-        let params = lsp_types::InitializeParams {
-            process_id: None,
-            root_path: None,
-            root_uri: None,
-            initialization_options: None,
-            capabilities: capabilities,
-            trace: None,
-            workspace_folders: None,
-            client_info: None,
-            locale: None,
-        };
+        let params: lsp_types::InitializeParams = Default::default();
         let params = serde_json::to_value(&params).unwrap();
 
         let (r, w) = pipe();
