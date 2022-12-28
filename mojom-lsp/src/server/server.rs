@@ -19,6 +19,7 @@ use serde_json::Value;
 
 use super::protocol::{
     read_message, ErrorCodes, Message, NotificationMessage, RequestMessage, ResponseError,
+    ResponseMessage,
 };
 
 use super::clangd::{self, ClangdParams};
@@ -28,7 +29,8 @@ use super::messagesender::{start_message_sender_thread, MessageSender};
 #[derive(PartialEq)]
 enum State {
     Initialized,
-    ShuttingDown,
+    ShuttingDown(u64),
+    Terminated,
 }
 
 struct ServerContext {
@@ -55,8 +57,18 @@ impl ServerContext {
 // Requests
 
 fn get_request_params<P: serde::de::DeserializeOwned>(
-    params: Value,
+    params: Option<Value>,
 ) -> std::result::Result<P, ResponseError> {
+    let params = match params {
+        Some(params) => params,
+        None => {
+            return Err(ResponseError::new(
+                ErrorCodes::InvalidParams,
+                "No parameters".to_string(),
+            ))
+        }
+    };
+
     serde_json::from_value::<P>(params)
         .map_err(|err| ResponseError::new(ErrorCodes::InvalidRequest, err.to_string()))
 }
@@ -64,7 +76,7 @@ fn get_request_params<P: serde::de::DeserializeOwned>(
 fn handle_request(ctx: &mut ServerContext, msg: RequestMessage) -> anyhow::Result<()> {
     let id = msg.id;
     let method = msg.method.as_str();
-    log::debug!("[recv] Request: id = {}, method = {}", id, method);
+    log::info!("[recv({})] Request: {}", id, method);
 
     // Workaround for Eglot. It sends "exit" as a request, not as a notification.
     if method == "exit" {
@@ -75,7 +87,7 @@ fn handle_request(ctx: &mut ServerContext, msg: RequestMessage) -> anyhow::Resul
     use lsp_types::request::*;
     let res = match method {
         Initialize::METHOD => initialize_request(),
-        Shutdown::METHOD => shutdown_request(ctx),
+        Shutdown::METHOD => shutdown_request(ctx, msg.id),
         GotoDefinition::METHOD => get_request_params(msg.params)
             .and_then(|params| goto_definition_request(&mut ctx.diag, params)),
         GotoImplementation::METHOD => get_request_params(msg.params)
@@ -91,6 +103,18 @@ fn handle_request(ctx: &mut ServerContext, msg: RequestMessage) -> anyhow::Resul
         }
         Err(err) => ctx.msg_sender.send_error_response(id, err),
     };
+    Ok(())
+}
+
+fn handle_response(ctx: &mut ServerContext, msg: ResponseMessage) -> anyhow::Result<()> {
+    match ctx.state {
+        State::ShuttingDown(request_id) if request_id == msg.id => {
+            ctx.state = State::Terminated;
+        }
+        _ => {
+            log::debug!("Unimplemented response: {:?}", msg);
+        }
+    }
     Ok(())
 }
 
@@ -114,8 +138,8 @@ fn initialize_request() -> RequestResult {
     ))
 }
 
-fn shutdown_request(ctx: &mut ServerContext) -> RequestResult {
-    ctx.state = State::ShuttingDown;
+fn shutdown_request(ctx: &mut ServerContext, request_id: u64) -> RequestResult {
+    ctx.state = State::ShuttingDown(request_id);
     Ok(Value::Null)
 }
 
@@ -162,12 +186,16 @@ where
 
 // Notifications
 
-fn get_params<P: serde::de::DeserializeOwned>(params: Value) -> anyhow::Result<P> {
+fn get_params<P: serde::de::DeserializeOwned>(params: Option<Value>) -> anyhow::Result<P> {
+    let params = match params {
+        Some(params) => params,
+        None => anyhow::bail!("No parameters"),
+    };
     serde_json::from_value::<P>(params).map_err(|err| err.into())
 }
 
 fn handle_notification(ctx: &mut ServerContext, msg: NotificationMessage) -> anyhow::Result<()> {
-    log::debug!("[recv] Notification: method = {}", msg.method);
+    log::info!("[recv] Notification: {}", msg.method);
 
     use lsp_types::notification::*;
     match msg.method.as_str() {
@@ -196,11 +224,11 @@ fn handle_notification(ctx: &mut ServerContext, msg: NotificationMessage) -> any
 
 fn exit_notification(ctx: &mut ServerContext) {
     // https://microsoft.github.io/language-server-protocol/specification#exit
-    if ctx.state == State::ShuttingDown {
-        ctx.exit_code = Some(0);
-    } else {
-        ctx.exit_code = Some(1);
-    }
+    let exit_code = match ctx.state {
+        State::ShuttingDown(_) | State::Terminated => 0,
+        _ => 1,
+    };
+    ctx.exit_code = Some(exit_code);
 }
 
 fn did_open_text_document(ctx: &mut ServerContext, params: lsp_types::DidOpenTextDocumentParams) {
@@ -307,11 +335,12 @@ where
         let message = read_message(&mut reader)?;
         match message {
             Message::Request(request) => handle_request(&mut ctx, request)?,
+            Message::Response(response) => handle_response(&mut ctx, response)?,
             Message::Notification(notification) => handle_notification(&mut ctx, notification)?,
-            _ => unreachable!(),
         };
 
         if let Some(exit_code) = ctx.exit_code {
+            log::info!("[exit] {}", exit_code);
             return Ok(exit_code);
         }
     }
@@ -364,7 +393,7 @@ mod tests {
         write_notification(
             &mut writer,
             lsp_types::notification::Initialized::METHOD,
-            serde_json::Value::Null,
+            Some(serde_json::Value::Null),
         )
         .unwrap();
 
@@ -387,7 +416,7 @@ mod tests {
         write_notification(
             &mut writer,
             lsp_types::notification::Exit::METHOD,
-            serde_json::Value::Null,
+            Some(serde_json::Value::Null),
         )
         .unwrap();
 

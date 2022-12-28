@@ -42,13 +42,16 @@ where
 pub(crate) async fn send_notification<W, P>(
     writer: &mut W,
     method: &str,
-    params: &P,
+    params: Option<&P>,
 ) -> anyhow::Result<()>
 where
     W: AsyncWrite + Unpin,
     P: Serialize,
 {
-    let params = serde_json::to_value(params)?;
+    let params = match params {
+        Some(params) => Some(serde_json::to_value(params)?),
+        None => None,
+    };
     let message = JsonRpcNotificationMessage {
         jsonrpc: "2.0",
         method,

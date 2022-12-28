@@ -36,7 +36,8 @@ impl Message {
 pub(crate) struct RequestMessage {
     pub id: u64,
     pub method: String,
-    pub params: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: Option<Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -131,7 +132,8 @@ impl From<ErrorCodes> for i32 {
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct NotificationMessage {
     pub method: String,
-    pub params: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: Option<Value>,
 }
 
 // https://microsoft.github.io/language-server-protocol/specification#header-part
@@ -185,7 +187,7 @@ pub(crate) fn read_message(reader: &mut impl io::BufRead) -> anyhow::Result<Mess
     reader.read_exact(&mut buf)?;
     match Message::from_slice(&buf) {
         Ok(message) => Ok(message),
-        Err(_) => Err(anyhow!("Failed to parse message")),
+        Err(err) => Err(anyhow!("Failed to parse message: {:?}", err)),
     }
 }
 
@@ -253,13 +255,13 @@ pub(crate) fn write_error_response(
 pub(crate) struct JsonRpcNotificationMessage<'a> {
     pub jsonrpc: &'a str,
     pub method: &'a str,
-    pub params: Value,
+    pub params: Option<Value>,
 }
 
 pub(crate) fn write_notification(
     writer: &mut impl Write,
     method: &str,
-    params: Value,
+    params: Option<Value>,
 ) -> anyhow::Result<()> {
     let message = JsonRpcNotificationMessage {
         jsonrpc: "2.0",

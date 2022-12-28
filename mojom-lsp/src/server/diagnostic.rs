@@ -363,7 +363,7 @@ fn publish_diagnostics(msg_sender: &MessageSender, params: lsp_types::PublishDia
     let params = serde_json::to_value(&params).unwrap();
     let msg = NotificationMessage {
         method: "textDocument/publishDiagnostics".to_owned(),
-        params: params,
+        params: Some(params),
     };
     msg_sender.send_notification(msg);
 }

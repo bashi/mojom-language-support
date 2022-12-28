@@ -77,7 +77,12 @@ pub(crate) fn initialize(
                 let error_message = anyhow!("Expected initialize message but got {:?}", req.method);
                 return Err(error_message);
             }
-            let params = serde_json::from_value::<lsp_types::InitializeParams>(req.params)?;
+            let params = match req.params {
+                Some(params) => params,
+                None => anyhow::bail!("No initialization parameters"),
+            };
+
+            let params = serde_json::from_value::<lsp_types::InitializeParams>(params)?;
             (req.id, params)
         }
         _ => {

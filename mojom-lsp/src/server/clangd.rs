@@ -267,9 +267,9 @@ impl CppBindings {
             transport
                 .send_notification(
                     notification::DidCloseTextDocument::METHOD,
-                    &lsp_types::DidCloseTextDocumentParams {
+                    Some(&lsp_types::DidCloseTextDocumentParams {
                         text_document: binding.text_document,
-                    },
+                    }),
                 )
                 .await?;
         }
@@ -345,7 +345,7 @@ where
         Ok(())
     }
 
-    async fn send_notification<P>(&mut self, method: &str, params: &P) -> anyhow::Result<()>
+    async fn send_notification<P>(&mut self, method: &str, params: Option<&P>) -> anyhow::Result<()>
     where
         P: Serialize,
     {
@@ -449,9 +449,9 @@ impl Inner {
         self.transport
             .send_notification(
                 notification::DidOpenTextDocument::METHOD,
-                &lsp_types::DidOpenTextDocumentParams {
+                Some(&lsp_types::DidOpenTextDocumentParams {
                     text_document: text_document_item.clone(),
-                },
+                }),
             )
             .await?;
 
@@ -621,7 +621,7 @@ where
     send_notification(
         writer,
         notification::Initialized::METHOD,
-        &lsp_types::InitializedParams {},
+        Some(&lsp_types::InitializedParams {}),
     )
     .await?;
 

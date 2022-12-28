@@ -46,7 +46,7 @@ pub(crate) struct MessageSender {
 
 impl MessageSender {
     pub(crate) fn send_success_response(&self, id: u64, res: Value) {
-        log::debug!("[send] Success: id = {}", id);
+        log::info!("[send({})] Success", id);
         let msg = SendingMessage::SuccessResponse(SuccessResponse {
             id: id,
             result: res,
@@ -55,13 +55,13 @@ impl MessageSender {
     }
 
     pub(crate) fn send_error_response(&self, id: u64, err: ResponseError) {
-        log::debug!("[send] Error: message = '{}'", err.message);
+        log::debug!("[send({})] Error: '{}'", id, err.message);
         let msg = SendingMessage::ErrorResponse(ErrorResponse { id: id, err: err });
         self.send(msg);
     }
 
     pub(crate) fn send_notification(&self, notif: NotificationMessage) {
-        log::debug!("[send] {}", notif.method);
+        log::debug!("[send] Notification: {}", notif.method);
         let msg = SendingMessage::Notification(notif);
         self.send(msg);
     }
