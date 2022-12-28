@@ -73,6 +73,10 @@
       {
         "command": "mojom.installLanguageServer",
         "title": "Install Mojom Language Server"
+      },
+      {
+        "command": "mojom.restartLanguageServer",
+        "title": "Restart Mojom Language Server"
       }
     ]
   },

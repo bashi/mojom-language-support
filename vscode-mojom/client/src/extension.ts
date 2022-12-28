@@ -64,7 +64,7 @@ function startClient(configuration: vscode.WorkspaceConfiguration) {
         break;
       case State.Stopped:
         lspStatusBarItem.hide();
-        if (client.initializeResult === undefined) {
+        if (event.oldState !== State.Running) {
           // Failed to start the server, update the configuration to disable the server.
           const configuration = vscode.workspace.getConfiguration("mojom");
           configuration.update("enableLanguageServer", "Disabled");
@@ -190,7 +190,7 @@ async function applyConfigurations() {
   } else if (enableLanguageServer === "Enabled" && serverPath === DEFAULT_SERVER_COMMAND) {
     tryToInstallLanguageServer(configuration);
   } else if (enableLanguageServer !== "Enabled") {
-    stopClient();
+    await stopClient();
   }
 }
 
@@ -199,13 +199,14 @@ function IsMojomTextEditor(editor: vscode.TextEditor | undefined): boolean {
 }
 
 export async function activate(context: vscode.ExtensionContext) {
+  const subscriptions = context.subscriptions;
+
   // Set up a status bar item for mojom-lsp.
   lspStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
   lspStatusBarItem.text = "mojom-lsp";
   lspStatusBarItem.hide();
+  subscriptions.push(lspStatusBarItem);
 
-  // Register Listeners
-  const subscriptions = context.subscriptions;
   subscriptions.push(vscode.workspace.onDidChangeConfiguration((event) => {
     if (event.affectsConfiguration("mojom")) {
       applyConfigurations();
@@ -220,9 +221,17 @@ export async function activate(context: vscode.ExtensionContext) {
     }
   }));
 
-  // Register commands
-  subscriptions.push(vscode.commands.registerCommand('mojom.installLanguageServer', async () => {
+  // Register commands.
+  subscriptions.push(vscode.commands.registerCommand("mojom.installLanguageServer", async () => {
     installServerBinary();
+  }));
+  subscriptions.push(vscode.commands.registerCommand("mojom.restartLanguageServer", async () => {
+    if (!client) {
+      return;
+    }
+    await stopClient();
+    const configuration = vscode.workspace.getConfiguration("mojom");
+    startClient(configuration);
   }));
 
   outputChannel = vscode.window.createOutputChannel("Mojom Language Server");
@@ -235,5 +244,5 @@ export function deactivate(): Thenable<void> | undefined {
   if (!client) {
     return undefined;
   }
-  return client.stop();
+  return stopClient();
 }
