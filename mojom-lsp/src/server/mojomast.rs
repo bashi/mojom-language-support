@@ -12,27 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::diagnostic::get_offset_from_position;
+use super::document_symbol::{self, DocumentSymbol};
 use crate::syntax::{self, Module, MojomFile};
-
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct InterfaceSymbol {
-    pub(crate) name: String,
-    pub(crate) range: lsp_types::Range,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct MethodSymbol {
-    pub(crate) name: String,
-    pub(crate) interface_name: String,
-    pub(crate) range: lsp_types::Range,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum DocumentSymbol {
-    Method(MethodSymbol),
-    Interface(InterfaceSymbol),
-}
 
 #[derive(Debug)]
 pub(crate) struct MojomAst {
@@ -98,52 +79,17 @@ impl MojomAst {
         lsp_types::Range::new(start, end)
     }
 
-    #[allow(unused)]
     pub(crate) fn find_symbol_from_position(
         &self,
         position: &lsp_types::Position,
     ) -> Option<DocumentSymbol> {
-        let offset = get_offset_from_position(&self.text, position);
-        let interfaces = self.mojom.stmts.iter().filter_map(|stmt| match stmt {
-            syntax::Statement::Interface(interface) => Some(interface),
-            _ => None,
-        });
-
-        for interface in interfaces {
-            if !interface.range.contains(offset) {
-                continue;
-            }
-            if interface.name.contains(offset) {
-                return Some(DocumentSymbol::Interface(InterfaceSymbol {
-                    name: self.text(&interface.name).to_string(),
-                    range: self.lsp_range(&interface.range),
-                }));
-            }
-
-            let methods = interface.members.iter().filter_map(|member| match member {
-                syntax::InterfaceMember::Method(method) => Some(method),
-                _ => None,
-            });
-            for method in methods {
-                if method.name.contains(offset) {
-                    let interface_name = self.text(&interface.name).to_string();
-                    let name = self.text(&method.name).to_string();
-                    let range = self.lsp_range(&method.range);
-                    return Some(DocumentSymbol::Method(MethodSymbol {
-                        name,
-                        interface_name,
-                        range,
-                    }));
-                }
-            }
-        }
-
-        None
+        document_symbol::find_symbol_from_position(&self.text, &self.mojom, position)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::document_symbol::{InterfaceSymbol, MethodSymbol};
     use super::*;
 
     #[test]

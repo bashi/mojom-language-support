@@ -560,6 +560,25 @@ impl<'a> SyntaxError<'a> {
         let end = line_col(&self.input, end).unwrap();
         (start, end)
     }
+
+    pub fn lsp_range(&self) -> lsp_types::Range {
+        let (start, end) = self.range();
+        lsp_types::Range {
+            start: lsp_types::Position::new(start.line as u32, start.col as u32),
+            end: lsp_types::Position::new(end.line as u32, end.col as u32),
+        }
+    }
+
+    pub fn lsp_diagnostic(&self) -> lsp_types::Diagnostic {
+        lsp_types::Diagnostic {
+            range: self.lsp_range(),
+            severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+            code: Some(lsp_types::NumberOrString::String("mojom".to_string())),
+            source: Some("mojom".to_string()),
+            message: self.to_string(),
+            ..Default::default()
+        }
+    }
 }
 
 impl<'a> std::fmt::Display for SyntaxError<'a> {

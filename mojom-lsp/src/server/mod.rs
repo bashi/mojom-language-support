@@ -13,9 +13,11 @@
 // limitations under the License.
 
 mod asyncrpc;
+pub mod asyncserver;
 mod clangd;
 mod definition;
 mod diagnostic;
+mod document_symbol;
 mod imported_files;
 mod initialization;
 mod messagesender;

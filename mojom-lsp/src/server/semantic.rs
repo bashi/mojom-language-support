@@ -25,7 +25,7 @@ fn partial_text<'a>(text: &'a str, range: &syntax::Range) -> &'a str {
     &text[range.start..range.end]
 }
 
-fn find_module(
+pub(crate) fn find_module(
     text: &str,
     mojom: &MojomFile,
     diagnostics: &mut Vec<lsp_types::Diagnostic>,

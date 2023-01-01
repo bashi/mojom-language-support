@@ -37,6 +37,8 @@ struct Args {
     /// Specify clangd log level.
     #[arg(long)]
     clangd_log_level: Option<log::Level>,
+    #[arg(long)]
+    use_tokio: bool,
 }
 
 pub fn main() -> anyhow::Result<()> {
@@ -62,12 +64,23 @@ pub fn main() -> anyhow::Result<()> {
     } else {
         None
     };
-    let options = mojom_lsp::server::ServerStartParams {
-        reader: std::io::stdin(),
-        writer: std::io::stdout(),
-        clangd_params,
-    };
 
-    let exit_code = mojom_lsp::server::start(options)?;
-    std::process::exit(exit_code);
+    if args.use_tokio {
+        let rt = tokio::runtime::Runtime::new()?;
+        let exit_code = rt.block_on(mojom_lsp::server::asyncserver::run(
+            tokio::io::stdin(),
+            tokio::io::stdout(),
+            clangd_params,
+        ))?;
+        std::process::exit(exit_code);
+    } else {
+        let options = mojom_lsp::server::ServerStartParams {
+            reader: std::io::stdin(),
+            writer: std::io::stdout(),
+            clangd_params,
+        };
+
+        let exit_code = mojom_lsp::server::start(options)?;
+        std::process::exit(exit_code);
+    }
 }

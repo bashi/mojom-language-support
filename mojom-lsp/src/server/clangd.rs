@@ -26,8 +26,9 @@ use tokio::runtime::Runtime;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
 use super::asyncrpc::{recv_message, send_notification, send_request};
-use super::mojomast::{DocumentSymbol, InterfaceSymbol, MethodSymbol};
-use super::protocol::{Message, ResponseMessage};
+use super::asyncserver::RpcSender;
+use super::document_symbol::{DocumentSymbol, InterfaceSymbol, MethodSymbol};
+use super::protocol::{ErrorCodes, Message, ResponseError, ResponseMessage};
 
 pub struct ClangdParams {
     pub clangd_path: PathBuf,
@@ -36,12 +37,12 @@ pub struct ClangdParams {
     pub log_level: Option<log::Level>,
 }
 
-pub(crate) struct Clangd {
+pub(crate) struct ClangdWrapper {
     rt: Runtime,
-    inner: Arc<Mutex<Inner>>,
+    inner: Arc<Mutex<Clangd>>,
 }
 
-impl Clangd {
+impl ClangdWrapper {
     pub(crate) fn terminate(self) -> anyhow::Result<()> {
         let inner = self.inner;
         self.rt.block_on(async {
@@ -60,7 +61,8 @@ impl Clangd {
         let inner = self.inner.clone();
         self.rt.block_on(async {
             let mut inner = inner.lock().unwrap();
-            inner.goto_implementation(params, target_symbol).await
+            let uri = &params.text_document_position_params.text_document.uri;
+            inner.goto_implementation(uri, target_symbol).await
         })
     }
 
@@ -72,7 +74,8 @@ impl Clangd {
         let inner = self.inner.clone();
         self.rt.block_on(async {
             let mut inner = inner.lock().unwrap();
-            inner.find_references(params, target_symbol).await
+            let uri = &params.text_document_position.text_document.uri;
+            inner.find_references(uri, target_symbol).await
         })
     }
 }
@@ -249,6 +252,7 @@ impl CppBindingHeader {
 
                 Some(location)
             }
+            _ => None,
         }
     }
 }
@@ -388,7 +392,7 @@ where
     }
 }
 
-struct Inner {
+pub(crate) struct Clangd {
     child: Child,
 
     root_path: PathBuf,
@@ -399,7 +403,7 @@ struct Inner {
     bindings: Option<CppBindings>,
 }
 
-impl Inner {
+impl Clangd {
     async fn ensure_binding_headers(&mut self, mojom_uri: &Url) -> anyhow::Result<()> {
         if let Some(cached) = self.bindings.as_ref() {
             if &cached.mojom_uri == mojom_uri {
@@ -492,13 +496,12 @@ impl Inner {
         Ok(())
     }
 
-    async fn goto_implementation(
+    pub(crate) async fn goto_implementation(
         &mut self,
-        params: request::GotoImplementationParams,
+        uri: &Url,
         target_symbol: DocumentSymbol,
     ) -> anyhow::Result<Option<request::GotoImplementationResponse>> {
-        self.ensure_binding_headers(&params.text_document_position_params.text_document.uri)
-            .await?;
+        self.ensure_binding_headers(uri).await?;
         self.bindings
             .as_ref()
             .unwrap()
@@ -506,13 +509,12 @@ impl Inner {
             .await
     }
 
-    async fn find_references(
+    pub(crate) async fn find_references(
         &mut self,
-        params: lsp_types::ReferenceParams,
+        uri: &Url,
         target_symbol: DocumentSymbol,
     ) -> anyhow::Result<Option<Vec<lsp_types::Location>>> {
-        self.ensure_binding_headers(&params.text_document_position.text_document.uri)
-            .await?;
+        self.ensure_binding_headers(uri).await?;
         self.bindings
             .as_ref()
             .unwrap()
@@ -521,26 +523,27 @@ impl Inner {
     }
 }
 
-pub(crate) fn start(root_path: PathBuf, params: ClangdParams) -> anyhow::Result<Clangd> {
+pub(crate) fn start_wrapper(
+    root_path: PathBuf,
+    params: ClangdParams,
+) -> anyhow::Result<ClangdWrapper> {
     let rt = Runtime::new()?;
+    let inner = rt.block_on(start(root_path, params))?;
+    let inner = Arc::new(Mutex::new(inner));
+    let clangd = ClangdWrapper { rt, inner };
+
+    Ok(clangd)
+}
+
+pub(crate) async fn start(root_path: PathBuf, mut params: ClangdParams) -> anyhow::Result<Clangd> {
+    use std::process::Stdio;
+
     let gen_path = if params.out_dir.is_absolute() {
         params.out_dir.clone().join("gen")
     } else {
         root_path.join(&params.out_dir).join("gen")
     };
-    let inner = rt.block_on(start_impl(root_path, gen_path, params))?;
-    let inner = Arc::new(Mutex::new(inner));
-    let clangd = Clangd { rt, inner };
 
-    Ok(clangd)
-}
-
-async fn start_impl(
-    root_path: PathBuf,
-    gen_path: PathBuf,
-    mut params: ClangdParams,
-) -> anyhow::Result<Inner> {
-    use std::process::Stdio;
     let mut command = Command::new(&params.clangd_path);
     command.stdin(Stdio::piped()).stdout(Stdio::piped());
     if params.log_level.is_some() {
@@ -572,7 +575,7 @@ async fn start_impl(
         receiver,
     };
 
-    Ok(Inner {
+    Ok(Clangd {
         child,
         root_path,
         gen_path,
@@ -680,4 +683,36 @@ where
 fn is_mojom_generated(uri: &Url) -> bool {
     let path = uri.path();
     path.contains("/gen/") && path.contains("mojom")
+}
+
+#[derive(Debug)]
+pub(crate) enum ClangdMessage {
+    GotoImplementation(u64, Url, DocumentSymbol),
+    References(u64, Url, DocumentSymbol),
+}
+
+pub(crate) async fn clangd_task(
+    mut clangd: Clangd,
+    mut receiver: Receiver<ClangdMessage>,
+    message_sender: RpcSender,
+) -> anyhow::Result<()> {
+    while let Some(message) = receiver.recv().await {
+        match message {
+            ClangdMessage::GotoImplementation(id, uri, target_symbol) => {
+                let response = clangd
+                    .goto_implementation(&uri, target_symbol)
+                    .await
+                    .map_err(|err| ResponseError::new(ErrorCodes::InternalError, err.to_string()));
+                message_sender.send_response_message(id, response).await?;
+            }
+            ClangdMessage::References(id, uri, target_symbol) => {
+                let response = clangd
+                    .find_references(&uri, target_symbol)
+                    .await
+                    .map_err(|err| ResponseError::new(ErrorCodes::InternalError, err.to_string()));
+                message_sender.send_response_message(id, response).await?;
+            }
+        }
+    }
+    Ok(())
 }

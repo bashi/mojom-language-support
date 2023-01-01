@@ -15,7 +15,7 @@
 use std::io::{self, Write};
 
 use anyhow::anyhow;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{from_slice, Value};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -38,6 +38,21 @@ pub(crate) struct RequestMessage {
     pub method: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub params: Option<Value>,
+}
+
+impl RequestMessage {
+    pub(crate) fn get_params<P>(&self) -> anyhow::Result<P>
+    where
+        P: DeserializeOwned,
+    {
+        let params = match self.params.as_ref() {
+            Some(params) => params.clone(),
+            None => anyhow::bail!("No parameters for {}", self.method),
+        };
+
+        let params = serde_json::from_value(params)?;
+        Ok(params)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -136,6 +151,21 @@ pub(crate) struct NotificationMessage {
     pub params: Option<Value>,
 }
 
+impl NotificationMessage {
+    pub(crate) fn get_params<P>(&self) -> anyhow::Result<P>
+    where
+        P: DeserializeOwned,
+    {
+        let params = match self.params.as_ref() {
+            Some(params) => params.clone(),
+            None => anyhow::bail!("No parameters for {}", self.method),
+        };
+
+        let params = serde_json::from_value(params)?;
+        Ok(params)
+    }
+}
+
 // https://microsoft.github.io/language-server-protocol/specification#header-part
 #[derive(Debug)]
 pub(crate) struct Header {
@@ -192,7 +222,7 @@ pub(crate) fn read_message(reader: &mut impl io::BufRead) -> anyhow::Result<Mess
 }
 
 #[derive(Serialize)]
-struct JsonRpcResponseMessage<'a> {
+pub(crate) struct JsonRpcResponseMessage<'a> {
     pub jsonrpc: &'a str,
     pub id: u64,
     #[serde(skip_serializing_if = "Option::is_none")]

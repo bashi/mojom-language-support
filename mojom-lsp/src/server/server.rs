@@ -323,7 +323,7 @@ where
     }
 
     let clangd = match options.clangd_params.take() {
-        Some(params) => Some(clangd::start(root_path.clone(), params)?),
+        Some(params) => Some(clangd::start_wrapper(root_path.clone(), params)?),
         None => None,
     };
 

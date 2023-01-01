@@ -23,10 +23,11 @@ use lsp_types::Url as Uri;
 
 use crate::syntax;
 
-use super::clangd::Clangd;
+use super::clangd::ClangdWrapper;
+use super::document_symbol::{get_identifier, DocumentSymbol};
 use super::imported_files::{check_imports, ImportedFiles};
 use super::messagesender::MessageSender;
-use super::mojomast::{DocumentSymbol, MojomAst};
+use super::mojomast::MojomAst;
 use super::protocol::NotificationMessage;
 
 pub(crate) fn create_diagnostic(range: lsp_types::Range, message: String) -> lsp_types::Diagnostic {
@@ -131,7 +132,7 @@ impl DiagnosticsThread {
 pub(crate) fn start_diagnostics_thread(
     root_path: PathBuf,
     msg_sender: MessageSender,
-    clangd: Option<Clangd>,
+    clangd: Option<ClangdWrapper>,
 ) -> DiagnosticsThread {
     let mut diag = Diagnostic::new(root_path, msg_sender, clangd);
     let (sender, receiver) = channel::<DiagnosticMessage>();
@@ -183,7 +184,7 @@ struct Diagnostic {
     // notifications.
     msg_sender: MessageSender,
     // A clangd client for goto implementation.
-    clangd: Option<Clangd>,
+    clangd: Option<ClangdWrapper>,
     // Current parsed syntax tree with the original text.
     ast: Option<MojomAst>,
     // Parsed mojom files that are imported from the current document.
@@ -191,7 +192,7 @@ struct Diagnostic {
 }
 
 impl Diagnostic {
-    fn new(root_path: PathBuf, msg_sender: MessageSender, clangd: Option<Clangd>) -> Self {
+    fn new(root_path: PathBuf, msg_sender: MessageSender, clangd: Option<ClangdWrapper>) -> Self {
         Diagnostic {
             root_path: root_path,
             msg_sender: msg_sender,
@@ -345,6 +346,7 @@ impl Diagnostic {
         match &mut symbol {
             DocumentSymbol::Interface(ref mut interface) => interface.name += "Proxy",
             DocumentSymbol::Method(ref mut method) => method.interface_name += "Proxy",
+            _ => (),
         }
 
         let response = clangd.find_references(params, symbol)?;
@@ -366,45 +368,6 @@ fn publish_diagnostics(msg_sender: &MessageSender, params: lsp_types::PublishDia
         params: Some(params),
     };
     msg_sender.send_notification(msg);
-}
-
-pub(crate) fn get_offset_from_position(text: &str, pos: &lsp_types::Position) -> usize {
-    let pos_line = pos.line as usize;
-    let pos_col = pos.character as usize;
-    let mut offset = 0;
-    for (i, line) in text.lines().enumerate() {
-        if i == pos_line {
-            break;
-        }
-        offset += line.len() + 1;
-    }
-    offset + pos_col
-}
-
-#[inline(always)]
-fn is_identifier_char(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || ch == '_' || ch == '.'
-}
-
-fn get_identifier<'a>(text: &'a str, pos: &lsp_types::Position) -> &'a str {
-    // TODO: The current implementation isn't accurate.
-
-    let offset = get_offset_from_position(text, pos);
-    let mut s = offset;
-    for ch in text[..offset].chars().rev() {
-        if !is_identifier_char(ch) {
-            break;
-        }
-        s -= 1;
-    }
-    let mut e = offset;
-    for ch in text[offset..].chars() {
-        if !is_identifier_char(ch) {
-            break;
-        }
-        e += 1;
-    }
-    &text[s..e]
 }
 
 fn find_definition_in_doc(ast: &MojomAst, ident: &str) -> Option<lsp_types::Location> {

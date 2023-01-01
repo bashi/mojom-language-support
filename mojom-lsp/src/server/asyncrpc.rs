@@ -17,7 +17,10 @@ use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt,
 };
 
-use super::protocol::{Header, JsonRpcNotificationMessage, JsonRpcRequestMessage, Message};
+use super::protocol::{
+    Header, JsonRpcNotificationMessage, JsonRpcRequestMessage, JsonRpcResponseMessage, Message,
+    ResponseError,
+};
 
 pub(crate) async fn send_request<W, P>(
     writer: &mut W,
@@ -37,6 +40,43 @@ where
         params,
     };
     send_message(writer, &message).await
+}
+
+pub(crate) struct Response {
+    id: u64,
+    result: Option<serde_json::Value>,
+    error: Option<ResponseError>,
+}
+
+impl Response {
+    pub(crate) fn new(id: u64) -> Self {
+        Response {
+            id,
+            result: None,
+            error: None,
+        }
+    }
+
+    pub(crate) fn result(mut self, result: impl Serialize) -> anyhow::Result<Self> {
+        self.result = Some(serde_json::to_value(result)?);
+        Ok(self)
+    }
+
+    #[allow(unused)]
+    pub(crate) fn error(mut self, error: ResponseError) -> Self {
+        self.error = Some(error);
+        self
+    }
+
+    pub(crate) async fn send<W: AsyncWrite + Unpin>(self, writer: &mut W) -> anyhow::Result<()> {
+        let message = JsonRpcResponseMessage {
+            jsonrpc: "2.0",
+            id: self.id,
+            result: self.result,
+            error: self.error,
+        };
+        send_message(writer, &message).await
+    }
 }
 
 pub(crate) async fn send_notification<W, P>(
