@@ -12,11 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::io::{self, Write};
-
-use anyhow::anyhow;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use serde_json::{from_slice, Value};
+use serde_json::Value;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -24,12 +21,6 @@ pub(crate) enum Message {
     Request(RequestMessage),
     Response(ResponseMessage),
     Notification(NotificationMessage),
-}
-
-impl Message {
-    fn from_slice(buf: &[u8]) -> serde_json::Result<Message> {
-        from_slice::<Message>(buf)
-    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -64,30 +55,6 @@ pub(crate) struct ResponseMessage {
     pub error: Option<ResponseError>,
 }
 
-#[derive(Serialize)]
-pub(crate) struct JsonRpcRequestMessage<'a> {
-    pub jsonrpc: &'a str,
-    pub id: u64,
-    pub method: &'a str,
-    pub params: Value,
-}
-
-#[allow(unused)]
-pub(crate) fn write_request(
-    writer: &mut impl Write,
-    id: u64,
-    method: &str,
-    params: Value,
-) -> anyhow::Result<()> {
-    let message = JsonRpcRequestMessage {
-        jsonrpc: "2.0",
-        id: id,
-        method: method,
-        params: params,
-    };
-    write_message(writer, message)
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct ResponseError {
     pub code: i32,
@@ -103,6 +70,28 @@ impl ResponseError {
             message: message,
             data: None,
         }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct NotificationMessage {
+    pub method: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: Option<Value>,
+}
+
+impl NotificationMessage {
+    pub(crate) fn get_params<P>(&self) -> anyhow::Result<P>
+    where
+        P: DeserializeOwned,
+    {
+        let params = match self.params.as_ref() {
+            Some(params) => params.clone(),
+            None => anyhow::bail!("No parameters for {}", self.method),
+        };
+
+        let params = serde_json::from_value(params)?;
+        Ok(params)
     }
 }
 
@@ -144,81 +133,18 @@ impl From<ErrorCodes> for i32 {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct NotificationMessage {
-    pub method: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub params: Option<Value>,
-}
-
-impl NotificationMessage {
-    pub(crate) fn get_params<P>(&self) -> anyhow::Result<P>
-    where
-        P: DeserializeOwned,
-    {
-        let params = match self.params.as_ref() {
-            Some(params) => params.clone(),
-            None => anyhow::bail!("No parameters for {}", self.method),
-        };
-
-        let params = serde_json::from_value(params)?;
-        Ok(params)
-    }
-}
-
 // https://microsoft.github.io/language-server-protocol/specification#header-part
 #[derive(Debug)]
 pub(crate) struct Header {
     pub content_length: usize,
 }
 
-fn read_header(reader: &mut impl io::BufRead) -> io::Result<Header> {
-    let mut content_length = None;
-    loop {
-        let mut line = String::new();
-        let n = reader.read_line(&mut line)?;
-        if n == 0 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "No header"));
-        }
-        if line == "\r\n" {
-            break;
-        }
-
-        let header_fields = line.trim().split(": ").collect::<Vec<_>>();
-        if header_fields.len() != 2 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Invalid header",
-            ));
-        }
-        let name = header_fields[0].to_ascii_lowercase();
-        let value = header_fields[1];
-
-        if name == "content-length" {
-            let value = match value.parse::<usize>() {
-                Ok(n) => n,
-                Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidInput, e)),
-            };
-            content_length = Some(value);
-        }
-    }
-
-    content_length
-        .map(|n| Header { content_length: n })
-        .ok_or(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "No content length",
-        ))
-}
-
-pub(crate) fn read_message(reader: &mut impl io::BufRead) -> anyhow::Result<Message> {
-    let header = read_header(reader)?;
-    let mut buf = vec![0; header.content_length];
-    reader.read_exact(&mut buf)?;
-    match Message::from_slice(&buf) {
-        Ok(message) => Ok(message),
-        Err(err) => Err(anyhow!("Failed to parse message: {:?}", err)),
-    }
+#[derive(Serialize)]
+pub(crate) struct JsonRpcRequestMessage<'a> {
+    pub jsonrpc: &'a str,
+    pub id: u64,
+    pub method: &'a str,
+    pub params: Value,
 }
 
 #[derive(Serialize)]
@@ -231,85 +157,9 @@ pub(crate) struct JsonRpcResponseMessage<'a> {
     pub error: Option<ResponseError>,
 }
 
-fn write_message<M: Serialize>(writer: &mut impl Write, message: M) -> anyhow::Result<()> {
-    let message = serde_json::to_string(&message)?;
-    let content_length = message.len();
-
-    write!(writer, "Content-Length: {}\r\n\r\n", content_length)?;
-    writer.write_all(message.as_bytes())?;
-    writer.flush()?;
-    Ok(())
-}
-
-pub(crate) fn write_success_result<R>(
-    writer: &mut impl Write,
-    id: u64,
-    res: R,
-) -> anyhow::Result<()>
-where
-    R: serde::Serialize,
-{
-    let res = serde_json::to_value(&res)?;
-    write_success_response(writer, id, res)
-}
-
-pub(crate) fn write_success_response(
-    writer: &mut impl Write,
-    id: u64,
-    result: Value,
-) -> anyhow::Result<()> {
-    let message = JsonRpcResponseMessage {
-        jsonrpc: "2.0",
-        id: id,
-        result: Some(result),
-        error: None,
-    };
-    write_message(writer, message)
-}
-
-pub(crate) fn write_error_response(
-    writer: &mut impl Write,
-    id: u64,
-    error: ResponseError,
-) -> anyhow::Result<()> {
-    let message = JsonRpcResponseMessage {
-        jsonrpc: "2.0",
-        id: id,
-        result: None,
-        error: Some(error),
-    };
-    write_message(writer, message)
-}
-
 #[derive(Serialize)]
 pub(crate) struct JsonRpcNotificationMessage<'a> {
     pub jsonrpc: &'a str,
     pub method: &'a str,
     pub params: Option<Value>,
-}
-
-pub(crate) fn write_notification(
-    writer: &mut impl Write,
-    method: &str,
-    params: Option<Value>,
-) -> anyhow::Result<()> {
-    let message = JsonRpcNotificationMessage {
-        jsonrpc: "2.0",
-        method: method,
-        params: params,
-    };
-    write_message(writer, message)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_read_header() {
-        let input = b"content-length: 208\r\n\r\n";
-        let mut reader = io::BufReader::new(&input[..]);
-        let header = read_header(&mut reader).unwrap();
-        assert_eq!(208, header.content_length);
-    }
 }

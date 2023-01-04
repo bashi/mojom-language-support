@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 
 use lsp_types::notification::{self, Notification};
 use lsp_types::request::{self, Request};
@@ -22,62 +21,18 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, Command};
-use tokio::runtime::Runtime;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
-use super::asyncrpc::{recv_message, send_notification, send_request};
-use super::asyncserver::RpcSender;
 use super::document_symbol::{DocumentSymbol, InterfaceSymbol, MethodSymbol};
 use super::protocol::{ErrorCodes, Message, ResponseError, ResponseMessage};
+use super::rpc::{recv_message, send_notification, send_request};
+use super::server::RpcSender;
 
 pub struct ClangdParams {
     pub clangd_path: PathBuf,
     pub out_dir: PathBuf,
     pub compile_commands_dir: Option<PathBuf>,
     pub log_level: Option<log::Level>,
-}
-
-pub(crate) struct ClangdWrapper {
-    rt: Runtime,
-    inner: Arc<Mutex<Clangd>>,
-}
-
-impl ClangdWrapper {
-    pub(crate) fn terminate(self) -> anyhow::Result<()> {
-        let inner = self.inner;
-        self.rt.block_on(async {
-            let mut inner = inner.lock().unwrap();
-            inner.child.kill().await?;
-            Ok::<(), anyhow::Error>(())
-        })?;
-        Ok(())
-    }
-
-    pub(crate) fn goto_implementation(
-        &mut self,
-        params: request::GotoImplementationParams,
-        target_symbol: DocumentSymbol,
-    ) -> anyhow::Result<Option<request::GotoImplementationResponse>> {
-        let inner = self.inner.clone();
-        self.rt.block_on(async {
-            let mut inner = inner.lock().unwrap();
-            let uri = &params.text_document_position_params.text_document.uri;
-            inner.goto_implementation(uri, target_symbol).await
-        })
-    }
-
-    pub(crate) fn find_references(
-        &mut self,
-        params: lsp_types::ReferenceParams,
-        target_symbol: DocumentSymbol,
-    ) -> anyhow::Result<Option<Vec<lsp_types::Location>>> {
-        let inner = self.inner.clone();
-        self.rt.block_on(async {
-            let mut inner = inner.lock().unwrap();
-            let uri = &params.text_document_position.text_document.uri;
-            inner.find_references(uri, target_symbol).await
-        })
-    }
 }
 
 struct CppBindingHeader {
@@ -393,6 +348,7 @@ where
 }
 
 pub(crate) struct Clangd {
+    #[allow(unused)]
     child: Child,
 
     root_path: PathBuf,
@@ -521,18 +477,6 @@ impl Clangd {
             .find_references(&mut self.transport, &target_symbol)
             .await
     }
-}
-
-pub(crate) fn start_wrapper(
-    root_path: PathBuf,
-    params: ClangdParams,
-) -> anyhow::Result<ClangdWrapper> {
-    let rt = Runtime::new()?;
-    let inner = rt.block_on(start(root_path, params))?;
-    let inner = Arc::new(Mutex::new(inner));
-    let clangd = ClangdWrapper { rt, inner };
-
-    Ok(clangd)
 }
 
 pub(crate) async fn start(root_path: PathBuf, mut params: ClangdParams) -> anyhow::Result<Clangd> {
@@ -694,7 +638,7 @@ pub(crate) enum ClangdMessage {
 pub(crate) async fn clangd_task(
     mut clangd: Clangd,
     mut receiver: Receiver<ClangdMessage>,
-    message_sender: RpcSender,
+    rpc_sender: RpcSender,
 ) -> anyhow::Result<()> {
     while let Some(message) = receiver.recv().await {
         match message {
@@ -703,14 +647,14 @@ pub(crate) async fn clangd_task(
                     .goto_implementation(&uri, target_symbol)
                     .await
                     .map_err(|err| ResponseError::new(ErrorCodes::InternalError, err.to_string()));
-                message_sender.send_response_message(id, response).await?;
+                rpc_sender.send_response_message(id, response).await?;
             }
             ClangdMessage::References(id, uri, target_symbol) => {
                 let response = clangd
                     .find_references(&uri, target_symbol)
                     .await
                     .map_err(|err| ResponseError::new(ErrorCodes::InternalError, err.to_string()));
-                message_sender.send_response_message(id, response).await?;
+                rpc_sender.send_response_message(id, response).await?;
             }
         }
     }

@@ -12,19 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod asyncrpc;
-pub mod asyncserver;
 mod clangd;
-mod definition;
-mod diagnostic;
 mod document_symbol;
-mod imported_files;
-mod initialization;
-mod messagesender;
 mod mojomast;
 mod protocol;
-mod semantic;
+mod rpc;
 mod server;
 
 pub use clangd::ClangdParams;
-pub use server::{start, ServerStartParams};
+pub use server::run;

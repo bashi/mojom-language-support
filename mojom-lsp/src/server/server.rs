@@ -1,4 +1,4 @@
-// Copyright 2020 Google LLC
+// Copyright 2022 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,246 +12,139 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::io::{BufReader, BufWriter, Read, Write};
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
-use serde_json::Value;
+use lsp_types::notification::{self, Notification};
+use lsp_types::request::{self, Request};
+use lsp_types::Url as Uri;
+use serde::Serialize;
+use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, BufReader};
+use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio::task::JoinHandle;
 
+use super::clangd::{self, ClangdMessage, ClangdParams};
+use super::document_symbol::DocumentSymbol;
+use super::mojomast::MojomAst;
 use super::protocol::{
-    read_message, ErrorCodes, Message, NotificationMessage, RequestMessage, ResponseError,
-    ResponseMessage,
+    Message, NotificationMessage, RequestMessage, ResponseError, ResponseMessage,
 };
+use super::rpc;
+use crate::syntax::{self, parse, Module, MojomFile};
 
-use super::clangd::{self, ClangdParams};
-use super::diagnostic::{start_diagnostics_thread, DiagnosticsThread};
-use super::messagesender::{start_message_sender_thread, MessageSender};
-
-#[derive(PartialEq)]
-enum State {
-    Initialized,
-    ShuttingDown(u64),
-    Terminated,
-}
-
-struct ServerContext {
-    state: State,
-    // A handler to send messages on the main thread.
-    msg_sender: MessageSender,
-    // A handler to the diagnostics thread.
-    diag: DiagnosticsThread,
-    // Set when `exit` notification is received.
-    exit_code: Option<i32>,
-}
-
-impl ServerContext {
-    fn new(msg_sender: MessageSender, diag: DiagnosticsThread) -> ServerContext {
-        ServerContext {
-            state: State::Initialized,
-            msg_sender,
-            diag,
-            exit_code: None,
-        }
-    }
-}
-
-// Requests
-
-fn get_request_params<P: serde::de::DeserializeOwned>(
-    params: Option<Value>,
-) -> std::result::Result<P, ResponseError> {
-    let params = match params {
-        Some(params) => params,
-        None => {
-            return Err(ResponseError::new(
-                ErrorCodes::InvalidParams,
-                "No parameters".to_string(),
-            ))
-        }
-    };
-
-    serde_json::from_value::<P>(params)
-        .map_err(|err| ResponseError::new(ErrorCodes::InvalidRequest, err.to_string()))
-}
-
-fn handle_request(ctx: &mut ServerContext, msg: RequestMessage) -> anyhow::Result<()> {
-    let id = msg.id;
-    let method = msg.method.as_str();
-    log::info!("[recv({})] Request: {}", id, method);
-
-    // Workaround for Eglot. It sends "exit" as a request, not as a notification.
-    if method == "exit" {
-        exit_notification(ctx);
-        return Ok(());
-    }
-
-    use lsp_types::request::*;
-    let res = match method {
-        Initialize::METHOD => initialize_request(),
-        Shutdown::METHOD => shutdown_request(ctx, msg.id),
-        GotoDefinition::METHOD => get_request_params(msg.params)
-            .and_then(|params| goto_definition_request(&mut ctx.diag, params)),
-        GotoImplementation::METHOD => get_request_params(msg.params)
-            .and_then(|params| goto_implementation_request(ctx, params)),
-        References::METHOD => {
-            get_request_params(msg.params).and_then(|params| find_references_request(ctx, params))
-        }
-        _ => unimplemented_request(id, method),
-    };
-    match res {
-        Ok(res) => {
-            ctx.msg_sender.send_success_response(id, res);
-        }
-        Err(err) => ctx.msg_sender.send_error_response(id, err),
-    };
-    Ok(())
-}
-
-fn handle_response(ctx: &mut ServerContext, msg: ResponseMessage) -> anyhow::Result<()> {
-    match ctx.state {
-        State::ShuttingDown(request_id) if request_id == msg.id => {
-            ctx.state = State::Terminated;
-        }
-        _ => {
-            log::debug!("Unimplemented response: {:?}", msg);
-        }
-    }
-    Ok(())
-}
-
-type RequestResult = std::result::Result<Value, ResponseError>;
-
-fn unimplemented_request(id: u64, method_name: &str) -> RequestResult {
-    let msg = format!(
-        "Unimplemented request: id = {} method = {}",
-        id, method_name
-    );
-    let err = ResponseError::new(ErrorCodes::InternalError, msg);
-    Err(err)
-}
-
-fn initialize_request() -> RequestResult {
-    // The server was already initialized.
-    let error_message = "Unexpected initialize message".to_owned();
-    Err(ResponseError::new(
-        ErrorCodes::ServerNotInitialized,
-        error_message,
-    ))
-}
-
-fn shutdown_request(ctx: &mut ServerContext, request_id: u64) -> RequestResult {
-    ctx.state = State::ShuttingDown(request_id);
-    Ok(Value::Null)
-}
-
-fn goto_definition_request(
-    diag: &mut DiagnosticsThread,
-    params: lsp_types::TextDocumentPositionParams,
-) -> RequestResult {
-    if let Some(loc) = diag.goto_definition(params.text_document.uri, params.position) {
-        let res = serde_json::to_value(loc).unwrap();
-        return Ok(res);
-    }
-    return Ok(Value::Null);
-}
-
-fn goto_implementation_request(
-    ctx: &mut ServerContext,
-    params: lsp_types::request::GotoImplementationParams,
-) -> RequestResult {
-    let response = ctx.diag.goto_implementation(params);
-    response_to_request_result(response)
-}
-
-fn find_references_request(
-    ctx: &mut ServerContext,
-    params: lsp_types::ReferenceParams,
-) -> RequestResult {
-    let response = ctx.diag.find_references(params);
-    response_to_request_result(response)
-}
-
-fn response_to_request_result<R>(response: anyhow::Result<Option<R>>) -> RequestResult
+pub async fn run<R, W>(
+    reader: R,
+    mut writer: W,
+    clangd_params: Option<ClangdParams>,
+) -> anyhow::Result<i32>
 where
-    R: serde::Serialize,
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
 {
-    match response {
-        Ok(Some(response)) => Ok(serde_json::to_value(response).unwrap()),
-        Ok(None) => Ok(Value::Null),
-        Err(err) => Err(ResponseError::new(
-            ErrorCodes::InternalError,
-            err.to_string(),
-        )),
-    }
-}
+    let mut reader = BufReader::new(reader);
 
-// Notifications
+    let params = initialize(&mut reader, &mut writer).await?;
 
-fn get_params<P: serde::de::DeserializeOwned>(params: Option<Value>) -> anyhow::Result<P> {
-    let params = match params {
-        Some(params) => params,
-        None => anyhow::bail!("No parameters"),
+    let root_path = match get_root_path(&params) {
+        Some(path) => path,
+        None => {
+            // Use the current directory.
+            std::env::current_dir()?
+        }
     };
-    serde_json::from_value::<P>(params).map_err(|err| err.into())
+    log::info!("Initialized, path = {:?}", root_path);
+
+    let context = Context {
+        parsed_files: HashMap::new(),
+    };
+    let context = Arc::new(Mutex::new(context));
+    let (sender, receiver) = mpsc::channel(64);
+    let sender = RpcSender { sender };
+    let sender_task_handle = tokio::spawn(sender_task(writer, receiver));
+
+    let clangd_sender = match clangd_params {
+        Some(params) => {
+            let clangd = clangd::start(root_path.clone(), params).await?;
+            let (clangd_sender, clangd_receiver) = mpsc::channel(64);
+            let _clangd_task_handle =
+                tokio::spawn(clangd::clangd_task(clangd, clangd_receiver, sender.clone()));
+            Some(clangd_sender)
+        }
+        None => None,
+    };
+
+    let server = Server {
+        state: ServerState::Running,
+        context,
+        reader,
+        sender,
+        sender_task_handle,
+        clangd_sender,
+    };
+
+    let exit_code = server.run().await?;
+    log::info!("Exit, status = {}", exit_code);
+    Ok(exit_code)
 }
 
-fn handle_notification(ctx: &mut ServerContext, msg: NotificationMessage) -> anyhow::Result<()> {
-    log::info!("[recv] Notification: {}", msg.method);
-
-    use lsp_types::notification::*;
-    match msg.method.as_str() {
-        Exit::METHOD => exit_notification(ctx),
-        DidOpenTextDocument::METHOD => {
-            get_params(msg.params).map(|params| did_open_text_document(ctx, params))?;
+async fn initialize<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+) -> anyhow::Result<lsp_types::InitializeParams>
+where
+    R: AsyncRead + AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let message = rpc::recv_message(reader).await?;
+    let (id, params) = match message {
+        Message::Request(request) if request.method == request::Initialize::METHOD => {
+            let params = match request.params {
+                Some(params) => params,
+                None => anyhow::bail!("No initialization parameters"),
+            };
+            let params = serde_json::from_value::<lsp_types::InitializeParams>(params)?;
+            (request.id, params)
         }
-        DidChangeTextDocument::METHOD => {
-            get_params(msg.params).map(|params| did_change_text_document(ctx, params))?;
-        }
-        DidCloseTextDocument::METHOD => {
-            get_params(msg.params).map(|params| did_close_text_document(ctx, params))?;
-        }
-        // Accept following notifications but do nothing.
-        DidChangeConfiguration::METHOD => (),
-        WillSaveTextDocument::METHOD => (),
-        DidSaveTextDocument::METHOD => (),
-        LogTrace::METHOD => (),
-        SetTrace::METHOD => (),
         _ => {
-            log::warn!("Received unimplemented notification: {:#?}", msg);
+            anyhow::bail!("Expected initialize message but got {:?}", message);
         }
-    }
-    Ok(())
-}
-
-fn exit_notification(ctx: &mut ServerContext) {
-    // https://microsoft.github.io/language-server-protocol/specification#exit
-    let exit_code = match ctx.state {
-        State::ShuttingDown(_) | State::Terminated => 0,
-        _ => 1,
     };
-    ctx.exit_code = Some(exit_code);
-}
 
-fn did_open_text_document(ctx: &mut ServerContext, params: lsp_types::DidOpenTextDocumentParams) {
-    ctx.diag
-        .check(params.text_document.uri, params.text_document.text);
-}
+    let text_document_sync_option = lsp_types::TextDocumentSyncOptions {
+        open_close: Some(true),
+        change: Some(lsp_types::TextDocumentSyncKind::FULL),
+        ..Default::default()
+    };
+    let text_document_sync = Some(lsp_types::TextDocumentSyncCapability::Options(
+        text_document_sync_option,
+    ));
+    let capabilities = lsp_types::ServerCapabilities {
+        text_document_sync,
+        definition_provider: Some(lsp_types::OneOf::Left(true)),
+        implementation_provider: Some(lsp_types::ImplementationProviderCapability::Simple(true)),
+        references_provider: Some(lsp_types::OneOf::Left(true)),
+        declaration_provider: Some(lsp_types::DeclarationCapability::Simple(true)),
+        ..Default::default()
+    };
+    let result = lsp_types::InitializeResult {
+        capabilities,
+        server_info: Some(lsp_types::ServerInfo {
+            name: "mojom-lsp".to_string(),
+            version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        }),
+    };
+    rpc::Response::new(id).result(result)?.send(writer).await?;
 
-fn did_change_text_document(
-    ctx: &mut ServerContext,
-    params: lsp_types::DidChangeTextDocumentParams,
-) {
-    let uri = params.text_document.uri.clone();
-    let content = params
-        .content_changes
-        .iter()
-        .map(|i| i.text.to_owned())
-        .collect::<Vec<_>>();
-    let text = content.join("");
-    ctx.diag.check(uri, text);
-}
-
-fn did_close_text_document(ctx: &mut ServerContext, params: lsp_types::DidCloseTextDocumentParams) {
-    ctx.diag.did_close_text_document(params);
+    let message = rpc::recv_message(reader).await?;
+    match message {
+        Message::Notification(notification)
+            if notification.method == notification::Initialized::METHOD =>
+        {
+            Ok(params)
+        }
+        _ => anyhow::bail!("Unexpected message: {:?}", message),
+    }
 }
 
 fn is_chromium_src_dir(path: &PathBuf) -> bool {
@@ -296,134 +189,526 @@ fn get_root_path(params: &lsp_types::InitializeParams) -> Option<PathBuf> {
     Some(path)
 }
 
-pub struct ServerStartParams<R, W>
+async fn sender_task<W>(mut writer: W, mut receiver: Receiver<Message>) -> anyhow::Result<()>
 where
-    R: Read,
-    W: Write + Send + 'static,
+    W: AsyncWrite + Unpin,
 {
-    pub reader: R,
-    pub writer: W,
-    pub clangd_params: Option<ClangdParams>,
+    while let Some(message) = receiver.recv().await {
+        rpc::send_message(&mut writer, &message).await?;
+    }
+    Ok(())
 }
 
-// Returns exit code.
-pub fn start<R, W>(mut options: ServerStartParams<R, W>) -> anyhow::Result<i32>
-where
-    R: Read,
-    W: Write + Send + 'static,
-{
-    let mut reader = BufReader::new(options.reader);
-    let mut writer = BufWriter::new(options.writer);
+pub(crate) struct Context {
+    parsed_files: HashMap<Uri, ParsedMojom>,
+}
 
-    let params = super::initialization::initialize(&mut reader, &mut writer)?;
+pub(crate) struct ParsedMojom {
+    #[allow(unused)]
+    version: Option<i32>,
+    ast: MojomAst,
+    imports: Vec<ParsedImport>,
+    #[allow(unused)]
+    module: Option<Module>,
+}
 
-    let root_path = get_root_path(&params).unwrap_or(PathBuf::new());
-    if root_path.exists() {
-        std::env::set_current_dir(&root_path)?;
+impl ParsedMojom {
+    fn find_definition(&self, position: &lsp_types::Position) -> Option<lsp_types::Location> {
+        let ident = self.ast.get_identifier(position);
+        self.ast
+            .find_definition(ident)
+            .or(self.find_definition_in_imports(ident))
     }
 
-    let clangd = match options.clangd_params.take() {
-        Some(params) => Some(clangd::start_wrapper(root_path.clone(), params)?),
-        None => None,
+    fn find_definition_in_imports(&self, ident: &str) -> Option<lsp_types::Location> {
+        self.imports
+            .iter()
+            .find_map(|import| import.find_definition(&ident))
+    }
+}
+
+pub(crate) struct ParsedImport {
+    uri: Uri,
+    module_name: Option<String>,
+    symbols: Vec<DocumentSymbol>,
+}
+
+impl ParsedImport {
+    fn find_definition(&self, ident: &str) -> Option<lsp_types::Location> {
+        for symbol in &self.symbols {
+            if symbol.name() == ident {
+                return Some(lsp_types::Location {
+                    uri: self.uri.clone(),
+                    range: symbol.range().clone(),
+                });
+            }
+            if let Some(module_name) = &self.module_name {
+                let qualified_name = format!("{}.{}", module_name, symbol.name());
+                if qualified_name == ident {
+                    return Some(lsp_types::Location {
+                        uri: self.uri.clone(),
+                        range: symbol.range().clone(),
+                    });
+                }
+            }
+        }
+        None
+    }
+}
+
+enum ServerState {
+    Running,
+    ShuttingDown,
+    Exit(i32),
+}
+struct Server<R>
+where
+    R: AsyncBufRead + Unpin,
+{
+    state: ServerState,
+    context: Arc<Mutex<Context>>,
+    reader: R,
+    sender: RpcSender,
+    #[allow(unused)]
+    sender_task_handle: JoinHandle<anyhow::Result<()>>,
+
+    clangd_sender: Option<Sender<ClangdMessage>>,
+}
+
+impl<R> Server<R>
+where
+    R: AsyncBufRead + Unpin,
+{
+    async fn run(mut self) -> anyhow::Result<i32> {
+        loop {
+            let message = rpc::recv_message(&mut self.reader).await?;
+            match message {
+                Message::Request(request) => self.handle_request(request).await?,
+                Message::Response(response) => self.handle_response(response).await?,
+                Message::Notification(notification) => {
+                    self.handle_notification(notification).await?
+                }
+            }
+
+            if let ServerState::Exit(exit_code) = self.state {
+                return Ok(exit_code);
+            }
+        }
+    }
+
+    async fn handle_request(&mut self, request: RequestMessage) -> anyhow::Result<()> {
+        log::info!("Request: {}({})", request.method, request.id);
+        match request.method.as_str() {
+            request::Shutdown::METHOD => {
+                self.state = ServerState::ShuttingDown;
+                self.sender
+                    .send_response_message(request.id, Ok(()))
+                    .await?;
+            }
+            request::GotoDefinition::METHOD => {
+                let context = Arc::clone(&self.context);
+                let params = request.get_params()?;
+                let response = goto_definition(context, params).await;
+                self.sender
+                    .send_response_message(request.id, response)
+                    .await?;
+            }
+            request::GotoImplementation::METHOD => {
+                let clangd_sender = match self.clangd_sender.as_ref() {
+                    Some(sender) => sender.clone(),
+                    None => {
+                        self.sender
+                            .send_response_message(request.id, Ok(()))
+                            .await?;
+                        return Ok(());
+                    }
+                };
+                let context = Arc::clone(&self.context);
+                let params = request.get_params()?;
+                goto_implementation(context, clangd_sender, request.id, params).await?;
+            }
+            request::References::METHOD => {
+                let clangd_sender = match self.clangd_sender.as_ref() {
+                    Some(sender) => sender.clone(),
+                    None => {
+                        self.sender
+                            .send_response_message(request.id, Ok(()))
+                            .await?;
+                        return Ok(());
+                    }
+                };
+                let context = Arc::clone(&self.context);
+                let params = request.get_params()?;
+                references(context, clangd_sender, request.id, params).await?;
+            }
+            _ => {
+                log::info!("Unimplemented request: {}", request.method);
+                return Ok(());
+            }
+        };
+
+        Ok(())
+    }
+
+    async fn handle_response(&mut self, response: ResponseMessage) -> anyhow::Result<()> {
+        log::info!("Unimplemehted response: {:#?}", response);
+        Ok(())
+    }
+
+    async fn handle_notification(
+        &mut self,
+        notification: NotificationMessage,
+    ) -> anyhow::Result<()> {
+        log::info!("Notification: {:#?}", notification);
+        match notification.method.as_str() {
+            notification::Exit::METHOD => {
+                let exit_code = match self.state {
+                    ServerState::ShuttingDown => 0,
+                    _ => 1,
+                };
+                self.state = ServerState::Exit(exit_code);
+            }
+            notification::DidOpenTextDocument::METHOD => {
+                let context = Arc::clone(&self.context);
+                let sender = self.sender.clone();
+                let params = notification.get_params()?;
+                tokio::spawn(did_open_text_document(context, sender, params));
+            }
+            notification::DidChangeTextDocument::METHOD => {
+                let context = Arc::clone(&self.context);
+                let sender = self.sender.clone();
+                let params = notification.get_params()?;
+                tokio::spawn(did_change_text_document(context, sender, params));
+            }
+            notification::DidCloseTextDocument::METHOD => {
+                let context = Arc::clone(&self.context);
+                let params = notification.get_params()?;
+                tokio::spawn(did_close_text_document(context, params));
+            }
+            // Ignore some notifications for now.
+            notification::Cancel::METHOD
+            | notification::SetTrace::METHOD
+            | notification::LogTrace::METHOD
+            | notification::DidChangeConfiguration::METHOD
+            | notification::WillSaveTextDocument::METHOD
+            | notification::DidSaveTextDocument::METHOD => (),
+            _ => {
+                log::info!("Unimplemented notification: {}", notification.method);
+            }
+        }
+        Ok(())
+    }
+}
+
+type ResponseResult<T> = std::result::Result<T, ResponseError>;
+
+async fn goto_definition(
+    context: Arc<Mutex<Context>>,
+    params: lsp_types::GotoDefinitionParams,
+) -> ResponseResult<Option<lsp_types::Location>> {
+    let context = context.lock().unwrap();
+
+    let uri = &params.text_document_position_params.text_document.uri;
+    let parsed = match context.parsed_files.get(uri) {
+        Some(parsed) => parsed,
+        None => return Ok(None),
     };
 
-    let msg_sender_thread = start_message_sender_thread(writer);
-    let diag = start_diagnostics_thread(root_path, msg_sender_thread.get_sender(), clangd);
+    let position = &params.text_document_position_params.position;
+    let response = parsed.find_definition(position);
+    Ok(response)
+}
 
-    let mut ctx = ServerContext::new(msg_sender_thread.get_sender(), diag);
-    loop {
-        let message = read_message(&mut reader)?;
-        match message {
-            Message::Request(request) => handle_request(&mut ctx, request)?,
-            Message::Response(response) => handle_response(&mut ctx, response)?,
-            Message::Notification(notification) => handle_notification(&mut ctx, notification)?,
+async fn goto_implementation(
+    context: Arc<Mutex<Context>>,
+    clangd_sender: Sender<ClangdMessage>,
+    request_id: u64,
+    params: request::GotoImplementationParams,
+) -> anyhow::Result<()> {
+    let context = context.lock().unwrap();
+
+    let uri = &params.text_document_position_params.text_document.uri;
+    let position = &params.text_document_position_params.position;
+    let symbol = match context
+        .parsed_files
+        .get(uri)
+        .and_then(|parsed| parsed.ast.find_symbol_from_position(position))
+    {
+        Some(symbol) => symbol,
+        None => return Ok(()),
+    };
+
+    clangd_sender
+        .send(ClangdMessage::GotoImplementation(
+            request_id,
+            uri.clone(),
+            symbol,
+        ))
+        .await?;
+    Ok(())
+}
+
+async fn references(
+    context: Arc<Mutex<Context>>,
+    clangd_sender: Sender<ClangdMessage>,
+    request_id: u64,
+    params: lsp_types::ReferenceParams,
+) -> anyhow::Result<()> {
+    let context = context.lock().unwrap();
+
+    let uri = &params.text_document_position.text_document.uri;
+    let position = &params.text_document_position.position;
+    let symbol = match context
+        .parsed_files
+        .get(uri)
+        .and_then(|parsed| parsed.ast.find_symbol_from_position(position))
+    {
+        Some(symbol) => symbol,
+        None => return Ok(()),
+    };
+
+    clangd_sender
+        .send(ClangdMessage::References(request_id, uri.clone(), symbol))
+        .await?;
+    Ok(())
+}
+
+async fn did_open_text_document(
+    context: Arc<Mutex<Context>>,
+    sender: RpcSender,
+    params: lsp_types::DidOpenTextDocumentParams,
+) -> anyhow::Result<()> {
+    let text_document = params.text_document;
+    update_mojom(
+        context,
+        sender,
+        text_document.uri,
+        text_document.text,
+        Some(text_document.version),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn did_change_text_document(
+    context: Arc<Mutex<Context>>,
+    sender: RpcSender,
+    mut params: lsp_types::DidChangeTextDocumentParams,
+) -> anyhow::Result<()> {
+    let uri = params.text_document.uri;
+    // Assume the client send the whole text.
+    let text = match params.content_changes.pop() {
+        Some(event) => event.text,
+        None => anyhow::bail!("No text"),
+    };
+    let version = Some(params.text_document.version);
+    update_mojom(context, sender, uri, text, version).await?;
+    Ok(())
+}
+
+async fn did_close_text_document(
+    context: Arc<Mutex<Context>>,
+    params: lsp_types::DidCloseTextDocumentParams,
+) -> anyhow::Result<()> {
+    let mut context = context.lock().unwrap();
+    context.parsed_files.remove(&params.text_document.uri);
+    Ok(())
+}
+
+async fn update_mojom(
+    context: Arc<Mutex<Context>>,
+    sender: RpcSender,
+    uri: Uri,
+    text: String,
+    version: Option<i32>,
+) -> anyhow::Result<()> {
+    {
+        let mut context = context.lock().unwrap();
+        context.parsed_files.remove(&uri);
+    }
+
+    let mut diagnostics = Vec::new();
+    let parsed = parse_mojom(uri.clone(), text, version, &mut diagnostics).await;
+
+    if let Some(parsed) = parsed {
+        let mut context = context.lock().unwrap();
+        context.parsed_files.insert(uri.clone(), parsed);
+    }
+
+    sender
+        .send_notification_message(
+            notification::PublishDiagnostics::METHOD,
+            lsp_types::PublishDiagnosticsParams {
+                uri,
+                diagnostics,
+                version,
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+async fn parse_mojom(
+    uri: Uri,
+    text: String,
+    version: Option<i32>,
+    diagnostics: &mut Vec<lsp_types::Diagnostic>,
+) -> Option<ParsedMojom> {
+    let mojom = match parse(&text) {
+        Ok(mojom) => mojom,
+        Err(err) => {
+            diagnostics.push(err.lsp_diagnostic());
+            return None;
+        }
+    };
+
+    let module = find_module(&text, &mojom, Some(diagnostics));
+
+    // Parse imported files.
+    let imports = mojom.stmts.iter().filter_map(|stmt| match stmt {
+        syntax::Statement::Import(import) => Some(import),
+        _ => None,
+    });
+    let mut parsed_imports = Vec::new();
+    for import in imports {
+        // `import.path` includes double quotes.
+        let start = import.path.start + 1;
+        let end = import.path.end - 1;
+        let import_path = &text[start..end];
+        let imported_text = match tokio::fs::read_to_string(import_path).await {
+            Ok(text) => text,
+            Err(err) => {
+                log::debug!("Failed to read imported file: {}: {:?}", import_path, err);
+                continue;
+            }
+        };
+        let imported_mojom = match parse(&imported_text) {
+            Ok(mojom) => mojom,
+            Err(err) => {
+                log::debug!("Failed to parse imported file: {}: {:?}", import_path, err);
+                continue;
+            }
         };
 
-        if let Some(exit_code) = ctx.exit_code {
-            log::info!("[exit] {}", exit_code);
-            return Ok(exit_code);
-        }
+        // Find module.
+        let module_name = find_module(&imported_text, &imported_mojom, None)
+            .map(|module| imported_text[module.name.start..module.name.end].to_string());
+
+        // `unwrap()` is safe because opening file succeeded.
+        let import_path = Path::new(import_path).canonicalize().unwrap();
+        let uri = Uri::from_file_path(import_path).unwrap();
+        let imported_ast = MojomAst::from_mojom(uri.clone(), imported_text, imported_mojom);
+
+        let symbols = imported_ast.get_document_symbols();
+        parsed_imports.push(ParsedImport {
+            uri,
+            module_name,
+            symbols,
+        });
+    }
+
+    let ast = MojomAst::from_mojom(uri, text, mojom);
+    let parsed = ParsedMojom {
+        version,
+        ast,
+        imports: parsed_imports,
+        module,
+    };
+    Some(parsed)
+}
+
+fn create_diagnostic(range: lsp_types::Range, message: String) -> lsp_types::Diagnostic {
+    lsp_types::Diagnostic {
+        range: range,
+        severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+        code: Some(lsp_types::NumberOrString::String("mojom".to_owned())),
+        code_description: None,
+        data: None,
+        source: Some("mojom-lsp".to_owned()),
+        message: message,
+        related_information: None,
+        tags: None,
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::super::protocol::{self, read_message, write_notification, write_request};
-    use super::*;
+fn into_lsp_range(start: &syntax::LineCol, end: &syntax::LineCol) -> lsp_types::Range {
+    lsp_types::Range {
+        start: lsp_types::Position::new(start.line as u32, start.col as u32),
+        end: lsp_types::Position::new(end.line as u32, end.col as u32),
+    }
+}
 
-    use lsp_types::notification::*;
-    use lsp_types::request::*;
-    use pipe::pipe;
+fn find_module(
+    text: &str,
+    mojom: &MojomFile,
+    mut diagnostics: Option<&mut Vec<lsp_types::Diagnostic>>,
+) -> Option<Module> {
+    let partial_text = |range: &syntax::Range| &text[range.start..range.end];
+    let mut module: Option<Module> = None;
+    for stmt in &mojom.stmts {
+        match stmt {
+            syntax::Statement::Module(stmt) => {
+                if let Some(ref module) = module {
+                    if let Some(diagnostics) = diagnostics.as_mut() {
+                        let message = format!(
+                            "Found more than one module statement: {} and {}",
+                            partial_text(&module.name),
+                            partial_text(&stmt.name)
+                        );
+                        let start = syntax::line_col(text, stmt.name.start).unwrap();
+                        let end = syntax::line_col(text, stmt.name.end).unwrap();
+                        let range = into_lsp_range(&start, &end);
+                        let diagnostic = create_diagnostic(range, message);
+                        diagnostics.push(diagnostic);
+                    }
+                } else {
+                    module = Some(stmt.clone());
+                }
+            }
+            _ => (),
+        }
+    }
+    module
+}
 
-    #[test]
-    fn test_server_init() {
-        let (reader, mut writer) = pipe();
+#[derive(Clone)]
+pub(crate) struct RpcSender {
+    sender: Sender<Message>,
+}
 
-        let params: lsp_types::InitializeParams = Default::default();
-        let params = serde_json::to_value(&params).unwrap();
+impl RpcSender {
+    pub(crate) async fn send_notification_message(
+        &self,
+        method: &str,
+        params: impl Serialize,
+    ) -> anyhow::Result<()> {
+        let method = method.to_string();
+        let params = Some(serde_json::to_value(params)?);
+        let notification = NotificationMessage { method, params };
+        self.sender
+            .send(Message::Notification(notification))
+            .await?;
+        Ok(())
+    }
 
-        let (r, w) = pipe();
-        let options = ServerStartParams {
-            reader,
-            writer: w,
-            clangd_params: None,
+    pub(crate) async fn send_response_message(
+        &self,
+        id: u64,
+        result: std::result::Result<impl Serialize, ResponseError>,
+    ) -> anyhow::Result<()> {
+        let response = match result {
+            Ok(result) => ResponseMessage {
+                id,
+                result: Some(serde_json::to_value(result)?),
+                error: None,
+            },
+            Err(err) => ResponseMessage {
+                id,
+                result: None,
+                error: Some(err),
+            },
         };
-        let handle = std::thread::spawn(move || {
-            let status = start(options);
-            status
-        });
-
-        write_request(
-            &mut writer,
-            1,
-            lsp_types::request::Initialize::METHOD,
-            params,
-        )
-        .unwrap();
-
-        let mut r = BufReader::new(r);
-        let msg = read_message(&mut r).unwrap();
-        match msg {
-            protocol::Message::Response(msg) => {
-                assert_eq!(1, msg.id);
-            }
-            _ => unreachable!(),
-        }
-
-        write_notification(
-            &mut writer,
-            lsp_types::notification::Initialized::METHOD,
-            Some(serde_json::Value::Null),
-        )
-        .unwrap();
-
-        write_request(
-            &mut writer,
-            2,
-            lsp_types::request::Shutdown::METHOD,
-            serde_json::Value::Null,
-        )
-        .unwrap();
-
-        let msg = read_message(&mut r).unwrap();
-        match msg {
-            protocol::Message::Response(msg) => {
-                assert_eq!(2, msg.id);
-            }
-            _ => unreachable!(),
-        }
-
-        write_notification(
-            &mut writer,
-            lsp_types::notification::Exit::METHOD,
-            Some(serde_json::Value::Null),
-        )
-        .unwrap();
-
-        drop(writer);
-        drop(r);
-
-        let status = handle.join().unwrap();
-        assert!(status.is_ok());
+        self.sender.send(Message::Response(response)).await?;
+        Ok(())
     }
 }
