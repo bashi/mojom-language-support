@@ -67,4 +67,19 @@ impl DocumentSymbol {
             DocumentSymbol::Const(s) => &s.range,
         }
     }
+
+    pub(crate) fn to_proxy_symbol(self) -> DocumentSymbol {
+        match self {
+            DocumentSymbol::Interface(s) => DocumentSymbol::Interface(InterfaceSymbol {
+                name: s.name + "Proxy",
+                range: s.range,
+            }),
+            DocumentSymbol::Method(s) => DocumentSymbol::Method(MethodSymbol {
+                name: s.name,
+                interface_name: s.interface_name + "Proxy",
+                range: s.range,
+            }),
+            _ => self,
+        }
+    }
 }

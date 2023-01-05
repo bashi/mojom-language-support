@@ -264,14 +264,17 @@ impl CppBindings {
     async fn find_references<W>(
         &self,
         transport: &mut Transport<W>,
-        target_symbol: &DocumentSymbol,
+        target_symbol: DocumentSymbol,
     ) -> anyhow::Result<Option<Vec<lsp_types::Location>>>
     where
         W: AsyncWrite + Unpin,
     {
+        // Use Proxy symbols for references.
+        let target_symbol = target_symbol.to_proxy_symbol();
+
         let mut all_locations = Vec::new();
         for binding in self.bindings.iter() {
-            if let Some(mut locations) = binding.find_references(transport, target_symbol).await? {
+            if let Some(mut locations) = binding.find_references(transport, &target_symbol).await? {
                 all_locations.append(&mut locations);
             }
         }
@@ -474,7 +477,7 @@ impl Clangd {
         self.bindings
             .as_ref()
             .unwrap()
-            .find_references(&mut self.transport, &target_symbol)
+            .find_references(&mut self.transport, target_symbol)
             .await
     }
 }
