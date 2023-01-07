@@ -26,12 +26,12 @@ use tokio::task::JoinHandle;
 
 use super::clangd::{self, ClangdMessage, ClangdParams};
 use super::document_symbol::DocumentSymbol;
-use super::mojomast::MojomAst;
+use super::mojomast::{check_mojom_text, MojomAst};
 use super::protocol::{
     Message, NotificationMessage, RequestMessage, ResponseError, ResponseMessage,
 };
 use super::rpc;
-use crate::syntax::{self, parse, Module, MojomFile};
+use crate::syntax::{self, MojomFile};
 
 pub async fn run<R, W>(
     reader: R,
@@ -208,8 +208,6 @@ pub(crate) struct ParsedMojom {
     version: Option<i32>,
     ast: MojomAst,
     imports: Vec<ParsedImport>,
-    #[allow(unused)]
-    module: Option<Module>,
 }
 
 impl ParsedMojom {
@@ -554,17 +552,28 @@ async fn parse_mojom(
     version: Option<i32>,
     diagnostics: &mut Vec<lsp_types::Diagnostic>,
 ) -> Option<ParsedMojom> {
-    let mojom = match parse(&text) {
-        Ok(mojom) => mojom,
-        Err(err) => {
-            diagnostics.push(err.lsp_diagnostic());
-            return None;
+    let mojom = {
+        let mut result = check_mojom_text(&text);
+        diagnostics.append(&mut result.diagnostics);
+        match result.mojom {
+            Some(mojom) => mojom,
+            None => {
+                return None;
+            }
         }
     };
 
-    let module = find_module(&text, &mojom, Some(diagnostics));
+    let imports = parse_imports(&text, &mojom).await;
+    let ast = MojomAst::from_mojom(uri, text, mojom);
+    let parsed = ParsedMojom {
+        version,
+        ast,
+        imports,
+    };
+    Some(parsed)
+}
 
-    // Parse imported files.
+async fn parse_imports(text: &str, mojom: &MojomFile) -> Vec<ParsedImport> {
     let imports = mojom.stmts.iter().filter_map(|stmt| match stmt {
         syntax::Statement::Import(import) => Some(import),
         _ => None,
@@ -582,17 +591,23 @@ async fn parse_mojom(
                 continue;
             }
         };
-        let imported_mojom = match parse(&imported_text) {
-            Ok(mojom) => mojom,
-            Err(err) => {
-                log::debug!("Failed to parse imported file: {}: {:?}", import_path, err);
-                continue;
-            }
-        };
 
-        // Find module.
-        let module_name = find_module(&imported_text, &imported_mojom, None)
-            .map(|module| imported_text[module.name.start..module.name.end].to_string());
+        let (imported_mojom, module_name) = {
+            let result = check_mojom_text(&imported_text);
+            let mojom = match result.mojom {
+                Some(mojom) => mojom,
+                None => {
+                    log::debug!(
+                        "Failed to parse imported file: {}: {:?}",
+                        import_path,
+                        result.diagnostics
+                    );
+                    continue;
+                }
+            };
+
+            (mojom, result.module_name)
+        };
 
         // `unwrap()` is safe because opening file succeeded.
         let import_path = Path::new(import_path).canonicalize().unwrap();
@@ -606,69 +621,7 @@ async fn parse_mojom(
             symbols,
         });
     }
-
-    let ast = MojomAst::from_mojom(uri, text, mojom);
-    let parsed = ParsedMojom {
-        version,
-        ast,
-        imports: parsed_imports,
-        module,
-    };
-    Some(parsed)
-}
-
-fn create_diagnostic(range: lsp_types::Range, message: String) -> lsp_types::Diagnostic {
-    lsp_types::Diagnostic {
-        range: range,
-        severity: Some(lsp_types::DiagnosticSeverity::ERROR),
-        code: Some(lsp_types::NumberOrString::String("mojom".to_owned())),
-        code_description: None,
-        data: None,
-        source: Some("mojom-lsp".to_owned()),
-        message: message,
-        related_information: None,
-        tags: None,
-    }
-}
-
-fn into_lsp_range(start: &syntax::LineCol, end: &syntax::LineCol) -> lsp_types::Range {
-    lsp_types::Range {
-        start: lsp_types::Position::new(start.line as u32, start.col as u32),
-        end: lsp_types::Position::new(end.line as u32, end.col as u32),
-    }
-}
-
-fn find_module(
-    text: &str,
-    mojom: &MojomFile,
-    mut diagnostics: Option<&mut Vec<lsp_types::Diagnostic>>,
-) -> Option<Module> {
-    let partial_text = |range: &syntax::Range| &text[range.start..range.end];
-    let mut module: Option<Module> = None;
-    for stmt in &mojom.stmts {
-        match stmt {
-            syntax::Statement::Module(stmt) => {
-                if let Some(ref module) = module {
-                    if let Some(diagnostics) = diagnostics.as_mut() {
-                        let message = format!(
-                            "Found more than one module statement: {} and {}",
-                            partial_text(&module.name),
-                            partial_text(&stmt.name)
-                        );
-                        let start = syntax::line_col(text, stmt.name.start).unwrap();
-                        let end = syntax::line_col(text, stmt.name.end).unwrap();
-                        let range = into_lsp_range(&start, &end);
-                        let diagnostic = create_diagnostic(range, message);
-                        diagnostics.push(diagnostic);
-                    }
-                } else {
-                    module = Some(stmt.clone());
-                }
-            }
-            _ => (),
-        }
-    }
-    module
+    parsed_imports
 }
 
 #[derive(Clone)]

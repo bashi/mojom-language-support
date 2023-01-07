@@ -18,6 +18,73 @@ use super::document_symbol::{
 };
 use crate::syntax::{self, MojomFile, Traversal};
 
+fn lsp_range(text: &str, range: &syntax::Range) -> lsp_types::Range {
+    let pos = syntax::line_col(text, range.start).unwrap();
+    let start = lsp_types::Position::new(pos.line as u32, pos.col as u32);
+    let pos = syntax::line_col(text, range.end).unwrap();
+    let end = lsp_types::Position::new(pos.line as u32, pos.col as u32);
+    lsp_types::Range::new(start, end)
+}
+
+fn create_diagnostic(range: lsp_types::Range, message: String) -> lsp_types::Diagnostic {
+    lsp_types::Diagnostic {
+        range,
+        severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+        code: Some(lsp_types::NumberOrString::String("mojom".to_owned())),
+        source: Some("mojom-lsp".to_owned()),
+        message: message,
+        ..Default::default()
+    }
+}
+
+pub(crate) struct CheckResult {
+    pub(crate) mojom: Option<MojomFile>,
+    pub(crate) module_name: Option<String>,
+    pub(crate) diagnostics: Vec<lsp_types::Diagnostic>,
+}
+
+pub(crate) fn check_mojom_text(text: &str) -> CheckResult {
+    let mut diagnostics = Vec::new();
+    let mojom = match syntax::parse(text) {
+        Ok(mojom) => mojom,
+        Err(err) => {
+            diagnostics.push(err.lsp_diagnostic());
+            return CheckResult {
+                mojom: None,
+                module_name: None,
+                diagnostics,
+            };
+        }
+    };
+
+    // Find module name.
+    let module_name = {
+        let mut modules = mojom.stmts.iter().filter_map(|stmt| match stmt {
+            syntax::Statement::Module(module) => Some(module),
+            _ => None,
+        });
+
+        let first_module = modules.next();
+        for invalid_module in modules {
+            let range = lsp_range(text, &invalid_module.range);
+            let message = format!(
+                "Found more than one module statement: {}",
+                &text[invalid_module.name.start..invalid_module.name.end]
+            );
+            diagnostics.push(create_diagnostic(range, message));
+        }
+
+        first_module.map(|module| text[module.name.start..module.name.end].to_string())
+    };
+
+    let mojom = Some(mojom);
+    CheckResult {
+        mojom,
+        module_name,
+        diagnostics,
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct MojomAst {
     uri: lsp_types::Url,
@@ -46,17 +113,8 @@ impl MojomAst {
     }
 
     // SAFETY: Only called from `self`.
-    fn line_col(&self, offset: usize) -> syntax::LineCol {
-        syntax::line_col(&self.text, offset).unwrap()
-    }
-
-    // SAFETY: Only called from `self`.
-    fn lsp_range(&self, field: &syntax::Range) -> lsp_types::Range {
-        let pos = self.line_col(field.start);
-        let start = lsp_types::Position::new(pos.line as u32, pos.col as u32);
-        let pos = self.line_col(field.end);
-        let end = lsp_types::Position::new(pos.line as u32, pos.col as u32);
-        lsp_types::Range::new(start, end)
+    fn lsp_range(&self, range: &syntax::Range) -> lsp_types::Range {
+        lsp_range(&self.text, range)
     }
 
     pub(crate) fn get_identifier(&self, pos: &lsp_types::Position) -> &str {
