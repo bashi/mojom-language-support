@@ -18,6 +18,7 @@ mod mojomast;
 mod protocol;
 mod rpc;
 mod server;
+mod workspace;
 
 pub use clangd::ClangdParams;
 pub use server::run;

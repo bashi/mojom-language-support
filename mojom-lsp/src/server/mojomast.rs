@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::path::Path;
+
+use lsp_types::Url as Uri;
+
 use super::document_symbol::{
     ConstSymbol, DocumentSymbol, EnumSymbol, InterfaceSymbol, MethodSymbol, StructSymbol,
     UnionSymbol,
@@ -41,6 +45,24 @@ pub(crate) struct CheckResult {
     pub(crate) mojom: Option<MojomFile>,
     pub(crate) module_name: Option<String>,
     pub(crate) diagnostics: Vec<lsp_types::Diagnostic>,
+}
+
+impl CheckResult {
+    pub(crate) fn create_ast(
+        mut self,
+        path: impl AsRef<Path>,
+        text: String,
+    ) -> anyhow::Result<MojomAst> {
+        let mojom = match self.mojom.take() {
+            Some(mojom) => mojom,
+            None => anyhow::bail!("No parsed mojom"),
+        };
+        let uri = Uri::from_file_path(path.as_ref()).map_err(|err| {
+            anyhow::anyhow!("Failed to conver {:?} to URI: {:?}", path.as_ref(), err)
+        })?;
+
+        Ok(MojomAst { uri, text, mojom })
+    }
 }
 
 pub(crate) fn check_mojom_text(text: &str) -> CheckResult {
@@ -87,7 +109,7 @@ pub(crate) fn check_mojom_text(text: &str) -> CheckResult {
 
 #[derive(Debug)]
 pub(crate) struct MojomAst {
-    uri: lsp_types::Url,
+    uri: Uri,
     text: String,
     mojom: MojomFile,
 }
@@ -105,6 +127,10 @@ impl MojomAst {
 
     pub(crate) fn from_mojom(uri: lsp_types::Url, text: String, mojom: MojomFile) -> MojomAst {
         MojomAst { uri, text, mojom }
+    }
+
+    pub(crate) fn uri(&self) -> Uri {
+        self.uri.clone()
     }
 
     // SAFETY: Only called from `self`.

@@ -68,6 +68,17 @@ impl DocumentSymbol {
         }
     }
 
+    pub(crate) fn kind(&self) -> lsp_types::SymbolKind {
+        match self {
+            DocumentSymbol::Method(_) => lsp_types::SymbolKind::METHOD,
+            DocumentSymbol::Interface(_) => lsp_types::SymbolKind::INTERFACE,
+            DocumentSymbol::Struct(_) => lsp_types::SymbolKind::STRUCT,
+            DocumentSymbol::Union(_) => lsp_types::SymbolKind::STRUCT,
+            DocumentSymbol::Enum(_) => lsp_types::SymbolKind::ENUM,
+            DocumentSymbol::Const(_) => lsp_types::SymbolKind::CONSTANT,
+        }
+    }
+
     pub(crate) fn to_proxy_symbol(self) -> DocumentSymbol {
         match self {
             DocumentSymbol::Interface(s) => DocumentSymbol::Interface(InterfaceSymbol {

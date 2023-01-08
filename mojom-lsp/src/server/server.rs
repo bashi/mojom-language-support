@@ -31,6 +31,7 @@ use super::protocol::{
     Message, NotificationMessage, RequestMessage, ResponseError, ResponseMessage,
 };
 use super::rpc;
+use super::workspace;
 use crate::syntax::{self, MojomFile};
 
 pub async fn run<R, W>(
@@ -74,11 +75,23 @@ where
         None => None,
     };
 
+    let (_workspace_task_handle, workspace_message_sender) = {
+        let (sender, receiver) = mpsc::channel(64);
+        let handle = tokio::spawn(workspace::workspace_task(
+            root_path.clone(),
+            sender.clone(),
+            receiver,
+        ));
+
+        (handle, sender)
+    };
+
     let server = Server {
         state: ServerState::Running,
         context,
         reader,
         sender,
+        workspace_message_sender,
         sender_task_handle,
         clangd_sender,
     };
@@ -125,6 +138,7 @@ where
         implementation_provider: Some(lsp_types::ImplementationProviderCapability::Simple(true)),
         references_provider: Some(lsp_types::OneOf::Left(true)),
         declaration_provider: Some(lsp_types::DeclarationCapability::Simple(true)),
+        workspace_symbol_provider: Some(lsp_types::OneOf::Left(true)),
         ..Default::default()
     };
     let result = lsp_types::InitializeResult {
@@ -267,6 +281,7 @@ where
     context: Arc<Mutex<Context>>,
     reader: R,
     sender: RpcSender,
+    workspace_message_sender: Sender<workspace::WorkspaceMessage>,
     #[allow(unused)]
     sender_task_handle: JoinHandle<anyhow::Result<()>>,
 
@@ -339,6 +354,25 @@ where
                 let params = request.get_params()?;
                 references(context, clangd_sender, request.id, params).await?;
             }
+            request::WorkspaceSymbol::METHOD => {
+                let params = request.get_params::<lsp_types::WorkspaceSymbolParams>()?;
+                let sender = self.sender.clone();
+                let workspace_message_sender = self.workspace_message_sender.clone();
+                tokio::spawn(async move {
+                    let (response_sender, response_receiver) = tokio::sync::oneshot::channel();
+                    workspace_message_sender
+                        .send(workspace::WorkspaceMessage::FindSymbol(
+                            params.query,
+                            response_sender,
+                        ))
+                        .await?;
+                    let response = response_receiver.await?;
+                    sender
+                        .send_response_message(request.id, Ok(response))
+                        .await?;
+                    anyhow::Ok(())
+                });
+            }
             _ => {
                 log::info!("Unimplemented request: {}", request.method);
                 return Ok(());
@@ -375,7 +409,12 @@ where
             notification::DidChangeTextDocument::METHOD => {
                 let context = Arc::clone(&self.context);
                 let sender = self.sender.clone();
-                let params = notification.get_params()?;
+                let params = notification.get_params::<lsp_types::DidChangeTextDocumentParams>()?;
+                self.workspace_message_sender
+                    .send(workspace::WorkspaceMessage::DidChangeTextDocument(
+                        params.text_document.uri.clone(),
+                    ))
+                    .await?;
                 tokio::spawn(did_change_text_document(context, sender, params));
             }
             notification::DidCloseTextDocument::METHOD => {
