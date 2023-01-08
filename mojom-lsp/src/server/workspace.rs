@@ -40,10 +40,16 @@ impl Workspace {
     ) -> anyhow::Result<()> {
         let mut symbols = Vec::new();
 
+        let target_name = match query.split("::").filter(|s| s.len() > 0).last() {
+            Some(name) => name,
+            None => return Ok(()),
+        };
+
         for (uri, parsed) in self.symbols.iter() {
             for symbol in parsed.symbols.iter() {
-                if symbol.name() == query {
-                    let location = lsp_types::Location::new(uri.clone(), symbol.range().clone());
+                if symbol.name() == target_name {
+                    let location =
+                        lsp_types::Location::new(uri.clone(), symbol.name_range().clone());
                     #[allow(deprecated)]
                     let symbol = lsp_types::SymbolInformation {
                         name: symbol.name().to_string(),

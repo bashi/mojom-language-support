@@ -184,6 +184,7 @@ impl MojomAst {
             if interface.name.contains(offset) {
                 return Some(DocumentSymbol::Interface(InterfaceSymbol {
                     name: self.text(&interface.name).to_string(),
+                    name_range: self.lsp_range(&interface.name),
                     range: self.lsp_range(&interface.range),
                 }));
             }
@@ -199,6 +200,7 @@ impl MojomAst {
                     let range = self.lsp_range(&method.range);
                     return Some(DocumentSymbol::Method(MethodSymbol {
                         name,
+                        name_range: self.lsp_range(&method.name),
                         interface_name,
                         range,
                     }));
@@ -216,8 +218,13 @@ impl MojomAst {
         macro_rules! push_symbol {
             ($kind:tt, $typ:ident, $node:expr) => {
                 let name = self.text(&$node.name).to_string();
+                let name_range = self.lsp_range(&$node.name);
                 let range = self.lsp_range(&$node.range);
-                let symbol = $typ { name, range };
+                let symbol = $typ {
+                    name,
+                    name_range,
+                    range,
+                };
                 symbols.push(DocumentSymbol::$kind(symbol));
             };
         }
@@ -226,10 +233,15 @@ impl MojomAst {
             match traversal {
                 Traversal::EnterInterface(node) => {
                     let name = self.text(&node.name).to_string();
+                    let name_range = self.lsp_range(&node.name);
                     let range = self.lsp_range(&node.range);
                     debug_assert!(interface.is_none());
                     interface = Some(name.clone());
-                    let symbol = InterfaceSymbol { name, range };
+                    let symbol = InterfaceSymbol {
+                        name,
+                        name_range,
+                        range,
+                    };
                     symbols.push(DocumentSymbol::Interface(symbol));
                 }
                 Traversal::LeaveInterface(_) => {
@@ -239,11 +251,13 @@ impl MojomAst {
                 Traversal::Method(node) => {
                     debug_assert!(interface.is_some());
                     let interface_name = interface.as_ref().unwrap().clone();
+                    let name_range = self.lsp_range(&node.name);
                     let name = self.text(&node.name).to_string();
                     let range = self.lsp_range(&node.range);
                     let symbol = MethodSymbol {
                         interface_name,
                         name,
+                        name_range,
                         range,
                     };
                     symbols.push(DocumentSymbol::Method(symbol));
@@ -346,6 +360,10 @@ mod tests {
 
         let expected = Some(DocumentSymbol::Interface(InterfaceSymbol {
             name: "MyInterface".to_string(),
+            name_range: lsp_types::Range::new(
+                lsp_types::Position::new(3, 10),
+                lsp_types::Position::new(3, 21),
+            ),
             range: lsp_types::Range::new(
                 lsp_types::Position::new(3, 0),
                 lsp_types::Position::new(8, 2),
@@ -359,6 +377,10 @@ mod tests {
 
         let expected = Some(DocumentSymbol::Method(MethodSymbol {
             name: "DoSomething".to_string(),
+            name_range: lsp_types::Range::new(
+                lsp_types::Position::new(7, 4),
+                lsp_types::Position::new(7, 15),
+            ),
             interface_name: "MyInterface".to_string(),
             range: lsp_types::Range::new(
                 lsp_types::Position::new(7, 4),

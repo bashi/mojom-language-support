@@ -1,0 +1,9 @@
+{
+    "mojom.languageServerPath": "${env:HOME}/work/mojom-language-support/mojom-lsp/target/debug/mojom-lsp",
+    "mojom.languageServerArguments": [
+        "--log-level=debug",
+        "--enable-clangd",
+        "--clangd-path=${userHome}/tmp/clangd_15.0.6/bin/clangd",
+        // "--clangd-log-level=info",
+    ],
+}
