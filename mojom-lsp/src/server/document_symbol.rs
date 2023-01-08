@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use lsp_types::Url as Uri;
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct InterfaceSymbol {
     pub(crate) name: String,
@@ -124,6 +126,19 @@ impl DocumentSymbol {
                 range: s.range,
             }),
             _ => self,
+        }
+    }
+
+    pub(crate) fn lsp_symbol(&self, uri: &Uri) -> lsp_types::SymbolInformation {
+        let location = lsp_types::Location::new(uri.clone(), self.range().clone());
+        #[allow(deprecated)]
+        lsp_types::SymbolInformation {
+            name: self.name().to_string(),
+            kind: self.kind(),
+            tags: None,
+            deprecated: None,
+            location,
+            container_name: None,
         }
     }
 }

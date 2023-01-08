@@ -1,43 +1,186 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use lsp_types::notification::{self, Notification};
+use lsp_types::request::{self, Request};
 use lsp_types::Url as Uri;
 use tokio::sync::mpsc;
-use tokio::sync::oneshot;
 
+use super::clangd::ClangdMessage;
 use super::document_symbol::DocumentSymbol;
-use super::mojomast::check_mojom_text;
+use super::mojomast::MojomAst;
+use super::protocol::{
+    ErrorCodes, NotificationMessage, RequestMessage, ResponseError, ResponseMessage,
+};
+use super::server::RpcSender;
+use crate::syntax;
+
+pub(crate) async fn workspace_task(
+    root_path: PathBuf,
+    rpc_sender: RpcSender,
+    clangd_sender: Option<mpsc::Sender<ClangdMessage>>,
+    sender: mpsc::Sender<WorkspaceMessage>,
+    mut receiver: mpsc::Receiver<WorkspaceMessage>,
+) -> anyhow::Result<()> {
+    let mut workspace = Workspace::new(rpc_sender, clangd_sender);
+
+    check_workspace_mojoms(&root_path, sender)?;
+
+    while let Some(message) = receiver.recv().await {
+        match message {
+            WorkspaceMessage::RpcRequest(request) => workspace.handle_request(request).await?,
+            WorkspaceMessage::RpcResponse(response) => workspace.handle_response(response).await?,
+            WorkspaceMessage::RpcNotification(notification) => {
+                workspace.handle_notification(notification).await?
+            }
+            WorkspaceMessage::DocumentSymbolsParsed(uri, parsed) => {
+                workspace.document_symbols_parsed(uri, parsed).await?
+            }
+        }
+    }
+
+    Ok(())
+}
 
 #[derive(Debug)]
 pub(crate) enum WorkspaceMessage {
-    FindSymbol(String, oneshot::Sender<Vec<lsp_types::SymbolInformation>>),
-    DidChangeTextDocument(Uri),
+    RpcRequest(RequestMessage),
+    RpcResponse(ResponseMessage),
+    RpcNotification(NotificationMessage),
+
     DocumentSymbolsParsed(Uri, ParsedSymbols),
 }
 
 #[derive(Debug)]
 pub(crate) struct ParsedSymbols {
-    #[allow(unused)]
     module_name: Option<String>,
     symbols: Vec<DocumentSymbol>,
 }
 
+impl ParsedSymbols {
+    fn find_definition(&self, ident: &str) -> Option<lsp_types::Range> {
+        for symbol in &self.symbols {
+            if symbol.name() == ident {
+                return Some(symbol.range().clone());
+            }
+            if let Some(module_name) = &self.module_name {
+                let qualified_name = format!("{}.{}", module_name, symbol.name());
+                if qualified_name == ident {
+                    return Some(symbol.range().clone());
+                }
+            }
+        }
+        None
+    }
+}
+
+struct ParsedMojom {
+    #[allow(unused)]
+    version: Option<i32>,
+    ast: MojomAst,
+    import_uris: Vec<Uri>,
+}
+
 struct Workspace {
+    rpc_sender: RpcSender,
+    clangd_sender: Option<mpsc::Sender<ClangdMessage>>,
+    parsed_files: HashMap<Uri, ParsedMojom>,
     symbols: HashMap<Uri, ParsedSymbols>,
 }
 
 impl Workspace {
-    fn new() -> Self {
+    fn new(rpc_sender: RpcSender, clangd_sender: Option<mpsc::Sender<ClangdMessage>>) -> Self {
         Workspace {
+            rpc_sender,
+            clangd_sender,
+            parsed_files: HashMap::new(),
             symbols: HashMap::new(),
         }
     }
 
-    async fn find_symbol(
-        &self,
-        query: String,
-        sender: oneshot::Sender<Vec<lsp_types::SymbolInformation>>,
+    async fn handle_request(&mut self, request: RequestMessage) -> anyhow::Result<()> {
+        match request.method.as_str() {
+            request::Shutdown::METHOD => unreachable!(),
+            request::GotoDefinition::METHOD => {
+                self.goto_definition(request.id, request.get_params()?)
+                    .await?;
+            }
+            request::GotoImplementation::METHOD => {
+                self.goto_implementation(request.id, request.get_params()?)
+                    .await?;
+            }
+            request::References::METHOD => {
+                self.references(request.id, request.get_params()?).await?;
+            }
+            request::WorkspaceSymbol::METHOD => {
+                let params = request.get_params::<lsp_types::WorkspaceSymbolParams>()?;
+                self.find_symbol(request.id, params.query).await?;
+            }
+            request::DocumentSymbolRequest::METHOD => {
+                self.document_symbol(request.id, request.get_params()?)
+                    .await?;
+            }
+            _ => {
+                log::info!("Unimplemented request: {}", request.method);
+                let message = format!("{} is not implemented", request.method);
+                let error = ResponseError::new(ErrorCodes::InternalError, message);
+                self.rpc_sender
+                    .send_error_response(request.id, error)
+                    .await?;
+                return Ok(());
+            }
+        };
+
+        Ok(())
+    }
+
+    async fn handle_response(&mut self, response: ResponseMessage) -> anyhow::Result<()> {
+        log::info!("Unimplemehted response: {:#?}", response);
+        Ok(())
+    }
+
+    async fn handle_notification(
+        &mut self,
+        notification: NotificationMessage,
     ) -> anyhow::Result<()> {
+        match notification.method.as_str() {
+            notification::Exit::METHOD => unreachable!(),
+            notification::DidOpenTextDocument::METHOD => {
+                self.did_open_text_document(notification.get_params()?)
+                    .await?;
+            }
+            notification::DidChangeTextDocument::METHOD => {
+                self.did_change_text_document(notification.get_params()?)
+                    .await?;
+            }
+            notification::DidCloseTextDocument::METHOD => {
+                self.did_close_text_document(notification.get_params()?)
+                    .await?;
+            }
+            // Ignore some notifications for now.
+            notification::Cancel::METHOD
+            | notification::SetTrace::METHOD
+            | notification::LogTrace::METHOD
+            | notification::DidChangeConfiguration::METHOD
+            | notification::WillSaveTextDocument::METHOD
+            | notification::DidSaveTextDocument::METHOD => (),
+            _ => {
+                log::info!("Unimplemented notification: {}", notification.method);
+            }
+        }
+        Ok(())
+    }
+
+    async fn document_symbols_parsed(
+        &mut self,
+        uri: Uri,
+        parsed: ParsedSymbols,
+    ) -> anyhow::Result<()> {
+        self.symbols.insert(uri, parsed);
+        Ok(())
+    }
+
+    async fn find_symbol(&self, id: u64, query: String) -> anyhow::Result<()> {
         let mut symbols = Vec::new();
 
         let target_name = match query.split("::").filter(|s| s.len() > 0).last() {
@@ -45,9 +188,17 @@ impl Workspace {
             None => return Ok(()),
         };
 
+        let target_name_without_ptr = if target_name.ends_with("Ptr") {
+            Some(&target_name[..target_name.len() - 3])
+        } else {
+            None
+        };
+
         for (uri, parsed) in self.symbols.iter() {
             for symbol in parsed.symbols.iter() {
-                if symbol.name() == target_name {
+                let matched =
+                    symbol.name() == target_name || Some(symbol.name()) == target_name_without_ptr;
+                if matched {
                     let location =
                         lsp_types::Location::new(uri.clone(), symbol.name_range().clone());
                     #[allow(deprecated)]
@@ -63,12 +214,181 @@ impl Workspace {
                 }
             }
         }
-        sender.send(symbols).unwrap();
+        self.rpc_sender.send_success_response(id, symbols).await?;
         Ok(())
     }
 
-    async fn did_change_text_document(&mut self, uri: Uri) -> anyhow::Result<()> {
-        self.symbols.remove(&uri);
+    async fn goto_definition(
+        &mut self,
+        id: u64,
+        params: lsp_types::GotoDefinitionParams,
+    ) -> anyhow::Result<()> {
+        let uri = &params.text_document_position_params.text_document.uri;
+
+        let parsed = match self.parsed_files.get(uri) {
+            Some(parsed) => parsed,
+            None => {
+                self.rpc_sender.send_null_response(id).await?;
+                return Ok(());
+            }
+        };
+
+        let position = &params.text_document_position_params.position;
+        let ident = parsed.ast.get_identifier(position);
+        if let Some(location) = parsed.ast.find_definition(ident) {
+            self.rpc_sender.send_success_response(id, location).await?;
+            return Ok(());
+        }
+
+        for import_uri in &parsed.import_uris {
+            let import_symbols = match self.symbols.get(import_uri) {
+                Some(symbols) => symbols,
+                None => {
+                    let path = import_uri.to_file_path().unwrap();
+                    let parsed = match parse_mojom_symbols(path).await {
+                        Ok(parsed) => parsed,
+                        Err(err) => {
+                            log::debug!("Failed to parse import: {}: {:?}", import_uri, err);
+                            continue;
+                        }
+                    };
+                    self.symbols.insert(import_uri.clone(), parsed);
+                    self.symbols.get(import_uri).unwrap()
+                }
+            };
+
+            let range = match import_symbols.find_definition(ident) {
+                Some(range) => range,
+                None => continue,
+            };
+            let location = lsp_types::Location::new(import_uri.clone(), range);
+            self.rpc_sender.send_success_response(id, location).await?;
+            return Ok(());
+        }
+
+        self.rpc_sender.send_null_response(id).await?;
+        Ok(())
+    }
+
+    async fn goto_implementation(
+        &mut self,
+        id: u64,
+        params: request::GotoImplementationParams,
+    ) -> anyhow::Result<()> {
+        let clangd_sender = match self.clangd_sender.as_ref() {
+            Some(sender) => sender,
+            None => {
+                self.rpc_sender.send_null_response(id).await?;
+                return Ok(());
+            }
+        };
+
+        let uri = &params.text_document_position_params.text_document.uri;
+        let position = &params.text_document_position_params.position;
+        let symbol = match self
+            .parsed_files
+            .get(uri)
+            .and_then(|parsed| parsed.ast.find_symbol_from_position(position))
+        {
+            Some(symbol) => symbol,
+            None => {
+                self.rpc_sender.send_null_response(id).await?;
+                return Ok(());
+            }
+        };
+
+        clangd_sender
+            .send(ClangdMessage::GotoImplementation(id, uri.clone(), symbol))
+            .await?;
+        Ok(())
+    }
+
+    async fn references(
+        &mut self,
+        id: u64,
+        params: lsp_types::ReferenceParams,
+    ) -> anyhow::Result<()> {
+        let clangd_sender = match self.clangd_sender.as_ref() {
+            Some(sender) => sender,
+            None => {
+                self.rpc_sender.send_null_response(id).await?;
+                return Ok(());
+            }
+        };
+
+        let uri = &params.text_document_position.text_document.uri;
+        let position = &params.text_document_position.position;
+        let symbol = match self
+            .parsed_files
+            .get(uri)
+            .and_then(|parsed| parsed.ast.find_symbol_from_position(position))
+        {
+            Some(symbol) => symbol,
+            None => {
+                self.rpc_sender.send_null_response(id).await?;
+                return Ok(());
+            }
+        };
+
+        clangd_sender
+            .send(ClangdMessage::References(id, uri.clone(), symbol))
+            .await?;
+        Ok(())
+    }
+
+    async fn document_symbol(
+        &mut self,
+        id: u64,
+        params: lsp_types::DocumentSymbolParams,
+    ) -> anyhow::Result<()> {
+        let uri = params.text_document.uri;
+        let parsed = match self.parsed_files.get(&uri) {
+            Some(parsed) => parsed,
+            None => {
+                log::debug!("No parsed: {:?}", uri);
+                self.rpc_sender.send_success_response(id, ()).await?;
+                return Ok(());
+            }
+        };
+        let symbols = parsed
+            .ast
+            .get_document_symbols()
+            .into_iter()
+            .map(|s| s.lsp_symbol(&uri))
+            .collect::<Vec<_>>();
+        self.rpc_sender.send_success_response(id, symbols).await?;
+        Ok(())
+    }
+
+    async fn did_open_text_document(
+        &mut self,
+        params: lsp_types::DidOpenTextDocumentParams,
+    ) -> anyhow::Result<()> {
+        self.update_mojom(
+            params.text_document.uri,
+            params.text_document.text,
+            Some(params.text_document.version),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn did_change_text_document(
+        &mut self,
+        mut params: lsp_types::DidChangeTextDocumentParams,
+    ) -> anyhow::Result<()> {
+        let uri = &params.text_document.uri;
+        // Assume the client send the whole text.
+        let text = match params.content_changes.pop() {
+            Some(event) => event.text,
+            None => anyhow::bail!("No text"),
+        };
+        let version = Some(params.text_document.version);
+        self.update_mojom(uri.clone(), text, version).await?;
+
+        // Update symbols.
+        // TODO: Don't parse the text twice.
+        self.symbols.remove(uri);
         let path = match uri.to_file_path() {
             Ok(path) => path,
             Err(err) => {
@@ -77,54 +397,55 @@ impl Workspace {
             }
         };
 
-        let (uri, parsed) = match parse_mojom_symbols(path).await {
-            Ok((uri, parsed)) => (uri, parsed),
+        let parsed = match parse_mojom_symbols(path).await {
+            Ok(parsed) => parsed,
             Err(_) => {
                 // Maybe editing the file.
                 return Ok(());
             }
         };
-        self.symbols.insert(uri, parsed);
+        self.symbols.insert(uri.clone(), parsed);
         Ok(())
     }
 
-    async fn document_symbols_parsed(
+    async fn update_mojom(
         &mut self,
         uri: Uri,
-        parsed: ParsedSymbols,
+        text: String,
+        version: Option<i32>,
     ) -> anyhow::Result<()> {
-        self.symbols.insert(uri, parsed);
+        self.parsed_files.remove(&uri);
+
+        let mut diagnostics = Vec::new();
+        let parsed = check_syntax_and_semantics(text, version, &mut diagnostics).await;
+
+        if let Some(parsed) = parsed {
+            self.parsed_files.insert(uri.clone(), parsed);
+        }
+
+        self.rpc_sender
+            .send_notification_message(
+                notification::PublishDiagnostics::METHOD,
+                lsp_types::PublishDiagnosticsParams {
+                    uri,
+                    diagnostics,
+                    version,
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn did_close_text_document(
+        &mut self,
+        params: lsp_types::DidCloseTextDocumentParams,
+    ) -> anyhow::Result<()> {
+        self.parsed_files.remove(&params.text_document.uri);
         Ok(())
     }
 }
 
-pub(crate) async fn workspace_task(
-    root_path: PathBuf,
-    sender: mpsc::Sender<WorkspaceMessage>,
-    mut receiver: mpsc::Receiver<WorkspaceMessage>,
-) -> anyhow::Result<()> {
-    let mut workspace = Workspace::new();
-
-    parse_all_mojom(&root_path, sender)?;
-
-    while let Some(message) = receiver.recv().await {
-        match message {
-            WorkspaceMessage::FindSymbol(query, sender) => {
-                workspace.find_symbol(query, sender).await?
-            }
-            WorkspaceMessage::DidChangeTextDocument(uri) => {
-                workspace.did_change_text_document(uri).await?;
-            }
-            WorkspaceMessage::DocumentSymbolsParsed(uri, parsed) => {
-                workspace.document_symbols_parsed(uri, parsed).await?
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn parse_all_mojom(
+fn check_workspace_mojoms(
     root_path: impl AsRef<Path>,
     sender: mpsc::Sender<WorkspaceMessage>,
 ) -> anyhow::Result<()> {
@@ -143,7 +464,7 @@ fn parse_all_mojom(
                 let path = entry.path();
                 if path.extension().map(|ext| ext == "mojom").unwrap_or(false) {
                     let sender = sender.clone();
-                    tokio::spawn(check_mojom_file(path, sender));
+                    tokio::spawn(check_single_mojom(path, sender));
                 }
             }
         }
@@ -151,29 +472,57 @@ fn parse_all_mojom(
     Ok(())
 }
 
-async fn check_mojom_file(
+async fn check_single_mojom(
     path: PathBuf,
     sender: mpsc::Sender<WorkspaceMessage>,
 ) -> anyhow::Result<()> {
-    let (uri, parsed) = parse_mojom_symbols(path).await?;
+    let uri = lsp_types::Url::from_file_path(&path)
+        .map_err(|err| anyhow::anyhow!("Failed to convert path to Uri: {:?}", err))?;
+    let parsed = parse_mojom_symbols(path).await?;
     sender
         .send(WorkspaceMessage::DocumentSymbolsParsed(uri, parsed))
         .await?;
     Ok(())
 }
 
-async fn parse_mojom_symbols(path: PathBuf) -> anyhow::Result<(Uri, ParsedSymbols)> {
+async fn parse_mojom_symbols(path: PathBuf) -> anyhow::Result<ParsedSymbols> {
     let text = tokio::fs::read_to_string(&path).await?;
-    let mut result = check_mojom_text(&text);
+    let mojom =
+        syntax::parse(&text).map_err(|err| anyhow::anyhow!("Failed to parse mojom: {:?}", err))?;
+    let ast = MojomAst::from_mojom(text, mojom);
+    let mut result = ast.check_semantics();
     let module_name = result.module_name.take();
-    let ast = result.create_ast(path, text)?;
     let symbols = ast.get_document_symbols();
-    let uri = ast.uri();
     let parsed = ParsedSymbols {
         module_name,
         symbols,
     };
-    Ok((uri, parsed))
+    Ok(parsed)
+}
+
+async fn check_syntax_and_semantics(
+    text: String,
+    version: Option<i32>,
+    diagnostics: &mut Vec<lsp_types::Diagnostic>,
+) -> Option<ParsedMojom> {
+    let mojom = match syntax::parse(&text) {
+        Ok(mojom) => mojom,
+        Err(err) => {
+            diagnostics.push(err.lsp_diagnostic());
+            return None;
+        }
+    };
+
+    let ast = MojomAst::from_mojom(text, mojom);
+    let mut result = ast.check_semantics();
+    let import_uris = result.import_uris;
+    diagnostics.append(&mut result.diagnostics);
+
+    Some(ParsedMojom {
+        version,
+        ast,
+        import_uris,
+    })
 }
 
 #[cfg(test)]
@@ -185,7 +534,7 @@ mod tests {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata");
         let (sender, mut receiver) = mpsc::channel(64);
 
-        parse_all_mojom(&path, sender)?;
+        check_workspace_mojoms(&path, sender)?;
 
         let mut num_parsed = 0;
         while let Some(message) = receiver.recv().await {

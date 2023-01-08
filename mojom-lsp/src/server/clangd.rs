@@ -650,14 +650,14 @@ pub(crate) async fn clangd_task(
                     .goto_implementation(&uri, target_symbol)
                     .await
                     .map_err(|err| ResponseError::new(ErrorCodes::InternalError, err.to_string()));
-                rpc_sender.send_response_message(id, response).await?;
+                rpc_sender.send_response(id, response).await?;
             }
             ClangdMessage::References(id, uri, target_symbol) => {
                 let response = clangd
                     .find_references(&uri, target_symbol)
                     .await
                     .map_err(|err| ResponseError::new(ErrorCodes::InternalError, err.to_string()));
-                rpc_sender.send_response_message(id, response).await?;
+                rpc_sender.send_response(id, response).await?;
             }
         }
     }

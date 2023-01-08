@@ -22,94 +22,25 @@ use super::document_symbol::{
 };
 use crate::syntax::{self, MojomFile, Traversal};
 
-fn lsp_range(text: &str, range: &syntax::Range) -> lsp_types::Range {
-    let pos = syntax::line_col(text, range.start).unwrap();
-    let start = lsp_types::Position::new(pos.line as u32, pos.col as u32);
-    let pos = syntax::line_col(text, range.end).unwrap();
-    let end = lsp_types::Position::new(pos.line as u32, pos.col as u32);
-    lsp_types::Range::new(start, end)
-}
-
-fn create_diagnostic(range: lsp_types::Range, message: String) -> lsp_types::Diagnostic {
+fn create_semantics_diagnostic(range: lsp_types::Range, message: String) -> lsp_types::Diagnostic {
     lsp_types::Diagnostic {
         range,
         severity: Some(lsp_types::DiagnosticSeverity::ERROR),
         code: Some(lsp_types::NumberOrString::String("mojom".to_owned())),
         source: Some("mojom-lsp".to_owned()),
-        message: message,
+        message,
         ..Default::default()
     }
 }
 
-pub(crate) struct CheckResult {
-    pub(crate) mojom: Option<MojomFile>,
+pub(crate) struct SemanticsResult {
     pub(crate) module_name: Option<String>,
+    pub(crate) import_uris: Vec<Uri>,
     pub(crate) diagnostics: Vec<lsp_types::Diagnostic>,
-}
-
-impl CheckResult {
-    pub(crate) fn create_ast(
-        mut self,
-        path: impl AsRef<Path>,
-        text: String,
-    ) -> anyhow::Result<MojomAst> {
-        let mojom = match self.mojom.take() {
-            Some(mojom) => mojom,
-            None => anyhow::bail!("No parsed mojom"),
-        };
-        let uri = Uri::from_file_path(path.as_ref()).map_err(|err| {
-            anyhow::anyhow!("Failed to conver {:?} to URI: {:?}", path.as_ref(), err)
-        })?;
-
-        Ok(MojomAst { uri, text, mojom })
-    }
-}
-
-pub(crate) fn check_mojom_text(text: &str) -> CheckResult {
-    let mut diagnostics = Vec::new();
-    let mojom = match syntax::parse(text) {
-        Ok(mojom) => mojom,
-        Err(err) => {
-            diagnostics.push(err.lsp_diagnostic());
-            return CheckResult {
-                mojom: None,
-                module_name: None,
-                diagnostics,
-            };
-        }
-    };
-
-    // Find module name.
-    let module_name = {
-        let mut modules = mojom.stmts.iter().filter_map(|stmt| match stmt {
-            syntax::Statement::Module(module) => Some(module),
-            _ => None,
-        });
-
-        let first_module = modules.next();
-        for invalid_module in modules {
-            let range = lsp_range(text, &invalid_module.range);
-            let message = format!(
-                "Found more than one module statement: {}",
-                &text[invalid_module.name.start..invalid_module.name.end]
-            );
-            diagnostics.push(create_diagnostic(range, message));
-        }
-
-        first_module.map(|module| text[module.name.start..module.name.end].to_string())
-    };
-
-    let mojom = Some(mojom);
-    CheckResult {
-        mojom,
-        module_name,
-        diagnostics,
-    }
 }
 
 #[derive(Debug)]
 pub(crate) struct MojomAst {
-    uri: Uri,
     text: String,
     mojom: MojomFile,
 }
@@ -120,17 +51,11 @@ impl MojomAst {
         let text = std::fs::read_to_string(path.as_ref())?;
         let mojom =
             syntax::parse(&text).map_err(|err| anyhow::anyhow!("Failed to parse: {:?}", err))?;
-        let uri = lsp_types::Url::from_file_path(path)
-            .map_err(|err| anyhow::anyhow!("Failed to convert path to Uri: {:?}", err))?;
-        Ok(MojomAst { uri, text, mojom })
+        Ok(MojomAst { text, mojom })
     }
 
-    pub(crate) fn from_mojom(uri: lsp_types::Url, text: String, mojom: MojomFile) -> MojomAst {
-        MojomAst { uri, text, mojom }
-    }
-
-    pub(crate) fn uri(&self) -> Uri {
-        self.uri.clone()
+    pub(crate) fn from_mojom(text: String, mojom: MojomFile) -> MojomAst {
+        MojomAst { text, mojom }
     }
 
     // SAFETY: Only called from `self`.
@@ -140,7 +65,73 @@ impl MojomAst {
 
     // SAFETY: Only called from `self`.
     fn lsp_range(&self, range: &syntax::Range) -> lsp_types::Range {
-        lsp_range(&self.text, range)
+        let pos = syntax::line_col(&self.text, range.start).unwrap();
+        let start = lsp_types::Position::new(pos.line as u32, pos.col as u32);
+        let pos = syntax::line_col(&self.text, range.end).unwrap();
+        let end = lsp_types::Position::new(pos.line as u32, pos.col as u32);
+        lsp_types::Range::new(start, end)
+    }
+
+    pub(crate) fn check_semantics(&self) -> SemanticsResult {
+        let mut diagnostics = Vec::new();
+
+        // Find module name.
+        let module_name = {
+            let mut modules = self.mojom.stmts.iter().filter_map(|stmt| match stmt {
+                syntax::Statement::Module(module) => Some(module),
+                _ => None,
+            });
+
+            let first_module = modules.next();
+            for invalid_module in modules {
+                let range = self.lsp_range(&invalid_module.range);
+                let message = format!(
+                    "Found more than one module statement: {}",
+                    self.text(&invalid_module.name),
+                );
+                diagnostics.push(create_semantics_diagnostic(range, message));
+            }
+
+            first_module.map(|module| self.text(&module.name).to_string())
+        };
+
+        // Imports
+        let import_stmts = self.mojom.stmts.iter().filter_map(|stmt| match stmt {
+            syntax::Statement::Import(import) => Some(import),
+            _ => None,
+        });
+
+        let mut import_uris = Vec::new();
+        for import in import_stmts {
+            let path = self.text(&import.path);
+            // `import.path` include double quotes.
+            let path = &path[1..path.len() - 1];
+            let path = match Path::new(path).canonicalize() {
+                Ok(path) => path,
+                Err(err) => {
+                    let range = self.lsp_range(&import.range);
+                    let message = format!("Failed to find import path: {}: {:?}", path, err);
+                    diagnostics.push(create_semantics_diagnostic(range, message));
+                    continue;
+                }
+            };
+
+            if !path.exists() {
+                let range = self.lsp_range(&import.range);
+                let message = format!("Import path does not exist: {:?}", path);
+                diagnostics.push(create_semantics_diagnostic(range, message));
+                continue;
+            }
+
+            let uri = Uri::from_file_path(path).unwrap();
+            import_uris.push(uri);
+        }
+
+        SemanticsResult {
+            module_name,
+            import_uris,
+            diagnostics,
+        }
     }
 
     pub(crate) fn get_identifier(&self, pos: &lsp_types::Position) -> &str {
@@ -280,25 +271,25 @@ impl MojomAst {
         symbols
     }
 
-    pub(crate) fn find_definition(&self, ident: &str) -> Option<lsp_types::Location> {
+    pub(crate) fn find_definition(&self, ident: &str) -> Option<lsp_types::Range> {
         let mut path = Vec::new();
         for traversal in syntax::preorder(&self.mojom) {
-            let loc = match traversal {
+            let range = match traversal {
                 Traversal::EnterInterface(node) => {
-                    let loc = self.match_field(ident, &node.name, &mut path);
+                    let range = self.match_field(ident, &node.name, &mut path);
                     let name = self.text(&node.name);
                     path.push(name);
-                    loc
+                    range
                 }
                 Traversal::LeaveInterface(_) => {
                     path.pop();
                     None
                 }
                 Traversal::EnterStruct(node) => {
-                    let loc = self.match_field(ident, &node.name, &mut path);
+                    let range = self.match_field(ident, &node.name, &mut path);
                     let name = self.text(&node.name);
                     path.push(name);
-                    loc
+                    range
                 }
                 Traversal::LeaveStruct(_) => {
                     path.pop();
@@ -309,8 +300,8 @@ impl MojomAst {
                 Traversal::Const(node) => self.match_field(ident, &node.name, &mut path),
                 _ => None,
             };
-            if loc.is_some() {
-                return loc;
+            if range.is_some() {
+                return range;
             }
         }
         None
@@ -321,14 +312,14 @@ impl MojomAst {
         target: &'a str,
         field: &'b syntax::Range,
         path: &'c mut Vec<&'a str>,
-    ) -> Option<lsp_types::Location> {
+    ) -> Option<lsp_types::Range> {
         let name = self.text(field);
         path.push(name);
         let ident = path.join(".");
         path.pop();
         if ident == target {
             let range = self.lsp_range(field);
-            return Some(lsp_types::Location::new(self.uri.clone(), range));
+            return Some(range);
         }
         None
     }
