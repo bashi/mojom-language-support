@@ -26,7 +26,7 @@ pub(crate) async fn send_request<W, P>(
     writer: &mut W,
     id: u64,
     method: &str,
-    params: &P,
+    params: P,
 ) -> anyhow::Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -82,7 +82,7 @@ impl Response {
 pub(crate) async fn send_notification<W, P>(
     writer: &mut W,
     method: &str,
-    params: Option<&P>,
+    params: Option<P>,
 ) -> anyhow::Result<()>
 where
     W: AsyncWrite + Unpin,

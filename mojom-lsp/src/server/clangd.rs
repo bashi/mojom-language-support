@@ -61,7 +61,7 @@ impl CppBindingHeader {
             partial_result_params: Default::default(),
         };
         transport
-            .send_request(request::GotoImplementation::METHOD, &params)
+            .send_request(request::GotoImplementation::METHOD, params)
             .await?;
         let response = match transport
             .recv_response_or_null::<request::GotoImplementationResponse>()
@@ -113,7 +113,7 @@ impl CppBindingHeader {
         };
 
         transport
-            .send_request(request::References::METHOD, &params)
+            .send_request(request::References::METHOD, params)
             .await?;
         let mut response = match transport
             .recv_response_or_null::<Vec<lsp_types::Location>>()
@@ -226,7 +226,7 @@ impl CppBindings {
             transport
                 .send_notification(
                     notification::DidCloseTextDocument::METHOD,
-                    Some(&lsp_types::DidCloseTextDocumentParams {
+                    Some(lsp_types::DidCloseTextDocumentParams {
                         text_document: binding.text_document,
                     }),
                 )
@@ -297,7 +297,7 @@ impl<W> Transport<W>
 where
     W: AsyncWrite + Unpin,
 {
-    async fn send_request<P>(&mut self, method: &str, params: &P) -> anyhow::Result<()>
+    async fn send_request<P>(&mut self, method: &str, params: P) -> anyhow::Result<()>
     where
         P: Serialize,
     {
@@ -307,7 +307,7 @@ where
         Ok(())
     }
 
-    async fn send_notification<P>(&mut self, method: &str, params: Option<&P>) -> anyhow::Result<()>
+    async fn send_notification<P>(&mut self, method: &str, params: Option<P>) -> anyhow::Result<()>
     where
         P: Serialize,
     {
@@ -412,7 +412,7 @@ impl Clangd {
         self.transport
             .send_notification(
                 notification::DidOpenTextDocument::METHOD,
-                Some(&lsp_types::DidOpenTextDocumentParams {
+                Some(lsp_types::DidOpenTextDocumentParams {
                     text_document: text_document_item.clone(),
                 }),
             )
@@ -423,7 +423,7 @@ impl Clangd {
         self.transport
             .send_request(
                 request::DocumentSymbolRequest::METHOD,
-                &lsp_types::DocumentSymbolParams {
+                lsp_types::DocumentSymbolParams {
                     text_document: text_document.clone(),
                     work_done_progress_params: Default::default(),
                     partial_result_params: Default::default(),
@@ -556,7 +556,7 @@ where
         workspace_folders: Some(vec![workspace_folder]),
         ..Default::default()
     };
-    send_request(writer, 0, request::Initialize::METHOD, &params).await?;
+    send_request(writer, 0, request::Initialize::METHOD, params).await?;
 
     let message = recv_message(reader).await?;
     let init_response = match message {

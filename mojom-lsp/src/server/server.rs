@@ -22,7 +22,6 @@ use lsp_types::Url as Uri;
 use serde::Serialize;
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, BufReader};
 use tokio::sync::mpsc::{self, Receiver, Sender};
-use tokio::task::JoinHandle;
 
 use super::clangd::{self, ClangdMessage, ClangdParams};
 use super::document_symbol::DocumentSymbol;
@@ -60,9 +59,7 @@ where
         parsed_files: HashMap::new(),
     };
     let context = Arc::new(Mutex::new(context));
-    let (sender, receiver) = mpsc::channel(64);
-    let sender = RpcSender { sender };
-    let sender_task_handle = tokio::spawn(sender_task(writer, receiver));
+    let sender = spawn_sender_task(writer);
 
     let clangd_sender = match clangd_params {
         Some(params) => {
@@ -92,7 +89,6 @@ where
         reader,
         sender,
         workspace_message_sender,
-        sender_task_handle,
         clangd_sender,
     };
 
@@ -203,6 +199,15 @@ fn get_root_path(params: &lsp_types::InitializeParams) -> Option<PathBuf> {
     Some(path)
 }
 
+fn spawn_sender_task<W>(writer: W) -> RpcSender
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let (sender, receiver) = mpsc::channel(64);
+    tokio::spawn(sender_task(writer, receiver));
+    RpcSender { sender }
+}
+
 async fn sender_task<W>(mut writer: W, mut receiver: Receiver<Message>) -> anyhow::Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -282,8 +287,6 @@ where
     reader: R,
     sender: RpcSender,
     workspace_message_sender: Sender<workspace::WorkspaceMessage>,
-    #[allow(unused)]
-    sender_task_handle: JoinHandle<anyhow::Result<()>>,
 
     clangd_sender: Option<Sender<ClangdMessage>>,
 }
@@ -701,6 +704,81 @@ impl RpcSender {
             },
         };
         self.sender.send(Message::Response(response)).await?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::rpc::{recv_message, send_notification, send_request};
+    use super::*;
+
+    #[tokio::test]
+    async fn test_initialize_and_shutdown() -> anyhow::Result<()> {
+        env_logger::init();
+        let (client, server) = tokio::io::duplex(64);
+
+        let _client_handle = tokio::spawn(async move {
+            let (reader, mut writer) = tokio::io::split(client);
+            let mut reader = tokio::io::BufReader::new(reader);
+            let workspace_folders = {
+                let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata");
+                let uri = Uri::from_directory_path(path).unwrap();
+                let name = "testdata".to_string();
+                Some(vec![lsp_types::WorkspaceFolder { uri, name }])
+            };
+            let params = lsp_types::InitializeParams {
+                workspace_folders,
+                ..Default::default()
+            };
+            send_request(&mut writer, 0, request::Initialize::METHOD, &params).await?;
+
+            let message = recv_message(&mut reader).await?;
+            let response = match message {
+                Message::Response(response) => response,
+                _ => anyhow::bail!("Unexpected message: {:?}", message),
+            };
+            if let Some(error) = response.error {
+                anyhow::bail!("Initialize failed: {:?}", error);
+            }
+
+            send_notification(
+                &mut writer,
+                notification::Initialized::METHOD,
+                Some(lsp_types::InitializedParams {}),
+            )
+            .await?;
+
+            send_request(
+                &mut writer,
+                1,
+                request::Shutdown::METHOD,
+                serde_json::Value::Null,
+            )
+            .await?;
+
+            let message = recv_message(&mut reader).await?;
+            let response = match message {
+                Message::Response(response) => response,
+                _ => anyhow::bail!("Unexpected message: {:?}", message),
+            };
+            if let Some(error) = response.error {
+                anyhow::bail!("Shutdown failed: {:?}", error);
+            }
+
+            send_notification(
+                &mut writer,
+                notification::Exit::METHOD,
+                None as Option<serde_json::Value>,
+            )
+            .await?;
+
+            anyhow::Ok(())
+        });
+
+        let (reader, writer) = tokio::io::split(server);
+        let exit_code = run(reader, writer, None).await?;
+        assert_eq!(exit_code, 0);
         Ok(())
     }
 }
