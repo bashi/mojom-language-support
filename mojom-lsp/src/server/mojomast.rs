@@ -72,7 +72,7 @@ impl MojomAst {
         lsp_types::Range::new(start, end)
     }
 
-    pub(crate) fn check_semantics(&self) -> SemanticsResult {
+    pub(crate) fn check_semantics(&self, root_path: impl AsRef<Path>) -> SemanticsResult {
         let mut diagnostics = Vec::new();
 
         // Find module name.
@@ -106,7 +106,7 @@ impl MojomAst {
             let path = self.text(&import.path);
             // `import.path` include double quotes.
             let path = &path[1..path.len() - 1];
-            let path = match Path::new(path).canonicalize() {
+            let path = match root_path.as_ref().join(path).canonicalize() {
                 Ok(path) => path,
                 Err(err) => {
                     let range = self.lsp_range(&import.range);

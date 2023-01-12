@@ -22,9 +22,8 @@ pub(crate) async fn workspace_task(
     sender: mpsc::Sender<WorkspaceMessage>,
     mut receiver: mpsc::Receiver<WorkspaceMessage>,
 ) -> anyhow::Result<()> {
-    let mut workspace = Workspace::new(rpc_sender, clangd_sender);
-
     check_workspace_mojoms(&root_path, sender)?;
+    let mut workspace = Workspace::new(root_path, rpc_sender, clangd_sender);
 
     while let Some(message) = receiver.recv().await {
         match message {
@@ -78,10 +77,12 @@ struct ParsedMojom {
     #[allow(unused)]
     version: Option<i32>,
     ast: MojomAst,
+    module_name: Option<String>,
     import_uris: Vec<Uri>,
 }
 
 struct Workspace {
+    root_path: PathBuf,
     rpc_sender: RpcSender,
     clangd_sender: Option<mpsc::Sender<ClangdMessage>>,
     parsed_files: HashMap<Uri, ParsedMojom>,
@@ -89,8 +90,13 @@ struct Workspace {
 }
 
 impl Workspace {
-    fn new(rpc_sender: RpcSender, clangd_sender: Option<mpsc::Sender<ClangdMessage>>) -> Self {
+    fn new(
+        root_path: PathBuf,
+        rpc_sender: RpcSender,
+        clangd_sender: Option<mpsc::Sender<ClangdMessage>>,
+    ) -> Self {
         Workspace {
+            root_path,
             rpc_sender,
             clangd_sender,
             parsed_files: HashMap::new(),
@@ -235,7 +241,8 @@ impl Workspace {
 
         let position = &params.text_document_position_params.position;
         let ident = parsed.ast.get_identifier(position);
-        if let Some(location) = parsed.ast.find_definition(ident) {
+        if let Some(range) = parsed.ast.find_definition(ident) {
+            let location = lsp_types::Location::new(uri.clone(), range);
             self.rpc_sender.send_success_response(id, location).await?;
             return Ok(());
         }
@@ -245,7 +252,7 @@ impl Workspace {
                 Some(symbols) => symbols,
                 None => {
                     let path = import_uri.to_file_path().unwrap();
-                    let parsed = match parse_mojom_symbols(path).await {
+                    let parsed = match parse_mojom_symbols(&self.root_path, path).await {
                         Ok(parsed) => parsed,
                         Err(err) => {
                             log::debug!("Failed to parse import: {}: {:?}", import_uri, err);
@@ -385,26 +392,6 @@ impl Workspace {
         };
         let version = Some(params.text_document.version);
         self.update_mojom(uri.clone(), text, version).await?;
-
-        // Update symbols.
-        // TODO: Don't parse the text twice.
-        self.symbols.remove(uri);
-        let path = match uri.to_file_path() {
-            Ok(path) => path,
-            Err(err) => {
-                log::debug!("Failed to convert path: {:?}", err);
-                return Ok(());
-            }
-        };
-
-        let parsed = match parse_mojom_symbols(path).await {
-            Ok(parsed) => parsed,
-            Err(_) => {
-                // Maybe editing the file.
-                return Ok(());
-            }
-        };
-        self.symbols.insert(uri.clone(), parsed);
         Ok(())
     }
 
@@ -415,11 +402,18 @@ impl Workspace {
         version: Option<i32>,
     ) -> anyhow::Result<()> {
         self.parsed_files.remove(&uri);
+        self.symbols.remove(&uri);
 
         let mut diagnostics = Vec::new();
-        let parsed = check_syntax_and_semantics(text, version, &mut diagnostics).await;
+        let parsed =
+            check_syntax_and_semantics(&self.root_path, text, version, &mut diagnostics).await;
 
         if let Some(parsed) = parsed {
+            let symbols = ParsedSymbols {
+                symbols: parsed.ast.get_document_symbols(),
+                module_name: parsed.module_name.clone(),
+            };
+            self.symbols.insert(uri.clone(), symbols);
             self.parsed_files.insert(uri.clone(), parsed);
         }
 
@@ -464,7 +458,11 @@ fn check_workspace_mojoms(
                 let path = entry.path();
                 if path.extension().map(|ext| ext == "mojom").unwrap_or(false) {
                     let sender = sender.clone();
-                    tokio::spawn(check_single_mojom(path, sender));
+                    tokio::spawn(check_single_mojom(
+                        root_path.as_ref().to_owned(),
+                        path,
+                        sender,
+                    ));
                 }
             }
         }
@@ -473,24 +471,28 @@ fn check_workspace_mojoms(
 }
 
 async fn check_single_mojom(
+    root_path: PathBuf,
     path: PathBuf,
     sender: mpsc::Sender<WorkspaceMessage>,
 ) -> anyhow::Result<()> {
     let uri = lsp_types::Url::from_file_path(&path)
         .map_err(|err| anyhow::anyhow!("Failed to convert path to Uri: {:?}", err))?;
-    let parsed = parse_mojom_symbols(path).await?;
+    let parsed = parse_mojom_symbols(root_path, path).await?;
     sender
         .send(WorkspaceMessage::DocumentSymbolsParsed(uri, parsed))
         .await?;
     Ok(())
 }
 
-async fn parse_mojom_symbols(path: PathBuf) -> anyhow::Result<ParsedSymbols> {
+async fn parse_mojom_symbols(
+    root_path: impl AsRef<Path>,
+    path: PathBuf,
+) -> anyhow::Result<ParsedSymbols> {
     let text = tokio::fs::read_to_string(&path).await?;
     let mojom =
         syntax::parse(&text).map_err(|err| anyhow::anyhow!("Failed to parse mojom: {:?}", err))?;
     let ast = MojomAst::from_mojom(text, mojom);
-    let mut result = ast.check_semantics();
+    let mut result = ast.check_semantics(root_path);
     let module_name = result.module_name.take();
     let symbols = ast.get_document_symbols();
     let parsed = ParsedSymbols {
@@ -501,6 +503,7 @@ async fn parse_mojom_symbols(path: PathBuf) -> anyhow::Result<ParsedSymbols> {
 }
 
 async fn check_syntax_and_semantics(
+    root_path: impl AsRef<Path>,
     text: String,
     version: Option<i32>,
     diagnostics: &mut Vec<lsp_types::Diagnostic>,
@@ -514,13 +517,15 @@ async fn check_syntax_and_semantics(
     };
 
     let ast = MojomAst::from_mojom(text, mojom);
-    let mut result = ast.check_semantics();
+    let mut result = ast.check_semantics(root_path);
+    let module_name = result.module_name;
     let import_uris = result.import_uris;
     diagnostics.append(&mut result.diagnostics);
 
     Some(ParsedMojom {
         version,
         ast,
+        module_name,
         import_uris,
     })
 }

@@ -351,30 +351,141 @@ impl RpcSender {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
+    use lsp_types::Url as Uri;
+    use serde::de::DeserializeOwned;
+    use tokio::io::{BufReader, DuplexStream, ReadHalf, WriteHalf};
+    use tokio::task::JoinHandle;
+
     use super::super::rpc::{recv_message, send_notification, send_request};
     use super::*;
 
-    #[tokio::test]
-    async fn test_initialize_and_shutdown() -> anyhow::Result<()> {
-        env_logger::init();
-        let (client, server) = tokio::io::duplex(64);
+    fn workspace_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata")
+    }
 
-        let _client_handle = tokio::spawn(async move {
-            let (reader, mut writer) = tokio::io::split(client);
-            let mut reader = tokio::io::BufReader::new(reader);
+    fn workspace_uri(path: impl AsRef<Path>) -> Uri {
+        Uri::from_file_path(workspace_root().join(path).canonicalize().unwrap()).unwrap()
+    }
+
+    struct Server {
+        handle: JoinHandle<anyhow::Result<i32>>,
+    }
+
+    impl Server {
+        fn new(stream: DuplexStream) -> Self {
+            let handle = tokio::spawn(async move {
+                let (reader, writer) = tokio::io::split(stream);
+                let exit_code = run(reader, writer, None).await?;
+                anyhow::Ok(exit_code)
+            });
+            Server { handle }
+        }
+
+        async fn exit(self) -> anyhow::Result<i32> {
+            self.handle.await?
+        }
+    }
+
+    struct Client {
+        reader: BufReader<ReadHalf<DuplexStream>>,
+        writer: WriteHalf<DuplexStream>,
+        next_request_id: u64,
+    }
+
+    impl Client {
+        fn new(stream: DuplexStream) -> Self {
+            let (reader, writer) = tokio::io::split(stream);
+            let reader = tokio::io::BufReader::new(reader);
+            Client {
+                reader,
+                writer,
+                next_request_id: 0,
+            }
+        }
+
+        async fn send_request(
+            &mut self,
+            method: &'static str,
+            params: impl Serialize,
+        ) -> anyhow::Result<()> {
+            let id = self.next_request_id;
+            self.next_request_id += 1;
+            send_request(&mut self.writer, id, method, params).await?;
+            Ok(())
+        }
+
+        async fn send_notification(
+            &mut self,
+            method: &'static str,
+            params: Option<impl Serialize>,
+        ) -> anyhow::Result<()> {
+            send_notification(&mut self.writer, method, params).await?;
+            Ok(())
+        }
+
+        async fn recv_message(&mut self) -> anyhow::Result<Message> {
+            recv_message(&mut self.reader).await
+        }
+
+        async fn try_recv_response<R: DeserializeOwned>(&mut self) -> anyhow::Result<R> {
+            let message = self.recv_message().await?;
+            let response = match message {
+                Message::Response(response) => response,
+                _ => anyhow::bail!("Unexpected message: {:?}", message),
+            };
+            if let Some(error) = response.error {
+                anyhow::bail!("Shutdown failed: {:?}", error);
+            }
+            let result = match response.result {
+                Some(result) => result,
+                None => anyhow::bail!("No result"),
+            };
+            let response = serde_json::from_value(result)?;
+            Ok(response)
+        }
+
+        async fn try_recv_notification<N: notification::Notification>(
+            &mut self,
+        ) -> anyhow::Result<N::Params> {
+            let message = self.recv_message().await?;
+            let notification = match message {
+                Message::Notification(notification) => notification,
+                _ => anyhow::bail!("Unexpected message: {:?}", message),
+            };
+            if notification.method != N::METHOD {
+                anyhow::bail!(
+                    "Expected {} but got {} notification",
+                    N::METHOD,
+                    notification.method
+                );
+            }
+
+            let params = match notification.params {
+                Some(params) => params,
+                None => anyhow::bail!("No parameter for {}", N::METHOD),
+            };
+            let params = serde_json::from_value(params)?;
+            Ok(params)
+        }
+
+        async fn initialize(&mut self) -> anyhow::Result<()> {
+            let root_uri = Some(workspace_uri("."));
             let workspace_folders = {
-                let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata");
-                let uri = lsp_types::Url::from_directory_path(path).unwrap();
+                let uri = root_uri.clone().unwrap();
                 let name = "testdata".to_string();
                 Some(vec![lsp_types::WorkspaceFolder { uri, name }])
             };
             let params = lsp_types::InitializeParams {
                 workspace_folders,
+                root_uri,
                 ..Default::default()
             };
-            send_request(&mut writer, 0, request::Initialize::METHOD, &params).await?;
+            self.send_request(request::Initialize::METHOD, &params)
+                .await?;
 
-            let message = recv_message(&mut reader).await?;
+            let message = self.recv_message().await?;
             let response = match message {
                 Message::Response(response) => response,
                 _ => anyhow::bail!("Unexpected message: {:?}", message),
@@ -383,22 +494,19 @@ mod tests {
                 anyhow::bail!("Initialize failed: {:?}", error);
             }
 
-            send_notification(
-                &mut writer,
+            self.send_notification(
                 notification::Initialized::METHOD,
                 Some(lsp_types::InitializedParams {}),
             )
             .await?;
+            Ok(())
+        }
 
-            send_request(
-                &mut writer,
-                1,
-                request::Shutdown::METHOD,
-                serde_json::Value::Null,
-            )
-            .await?;
+        async fn shutdown(&mut self) -> anyhow::Result<()> {
+            self.send_request(request::Shutdown::METHOD, serde_json::Value::Null)
+                .await?;
 
-            let message = recv_message(&mut reader).await?;
+            let message = self.recv_message().await?;
             let response = match message {
                 Message::Response(response) => response,
                 _ => anyhow::bail!("Unexpected message: {:?}", message),
@@ -407,19 +515,96 @@ mod tests {
                 anyhow::bail!("Shutdown failed: {:?}", error);
             }
 
-            send_notification(
-                &mut writer,
+            self.send_notification(
                 notification::Exit::METHOD,
                 None as Option<serde_json::Value>,
             )
             .await?;
+            Ok(())
+        }
 
-            anyhow::Ok(())
+        async fn open(&mut self, path: impl AsRef<Path>) -> anyhow::Result<()> {
+            let uri = workspace_uri(path.as_ref());
+            let text = tokio::fs::read_to_string(uri.to_file_path().unwrap()).await?;
+            let params = lsp_types::DidOpenTextDocumentParams {
+                text_document: lsp_types::TextDocumentItem {
+                    uri,
+                    language_id: "mojom".to_string(),
+                    version: 0,
+                    text,
+                },
+            };
+            self.send_notification(notification::DidOpenTextDocument::METHOD, Some(params))
+                .await?;
+
+            let notification = self
+                .try_recv_notification::<notification::PublishDiagnostics>()
+                .await?;
+            if notification.diagnostics.len() > 0 {
+                log::warn!(
+                    "{:?} has diagnostics: {:#?}",
+                    path.as_ref(),
+                    notification.diagnostics
+                );
+            }
+            Ok(())
+        }
+    }
+
+    fn create_server_and_client() -> (Server, Client) {
+        static START: std::sync::Once = std::sync::Once::new();
+        START.call_once(|| {
+            let _ = env_logger::try_init();
         });
+        let (server, client) = tokio::io::duplex(64);
+        let server = Server::new(server);
+        let client = Client::new(client);
+        (server, client)
+    }
 
-        let (reader, writer) = tokio::io::split(server);
-        let exit_code = run(reader, writer, None).await?;
+    #[tokio::test]
+    async fn test_initialize_and_shutdown() -> anyhow::Result<()> {
+        let (server, mut client) = create_server_and_client();
+        client.initialize().await?;
+        client.shutdown().await?;
+        let exit_code = server.exit().await?;
         assert_eq!(exit_code, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_goto_definition() -> anyhow::Result<()> {
+        let (server, mut client) = create_server_and_client();
+        client.initialize().await?;
+
+        client.open("my_interface.mojom").await?;
+
+        let uri = workspace_uri("my_interface.mojom");
+        let text_document = lsp_types::TextDocumentIdentifier { uri };
+        let position = lsp_types::Position {
+            line: 6,
+            character: 23,
+        };
+        let text_document_position_params = lsp_types::TextDocumentPositionParams {
+            text_document,
+            position,
+        };
+        let params = lsp_types::GotoDefinitionParams {
+            text_document_position_params,
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        client
+            .send_request(request::GotoDefinition::METHOD, params)
+            .await?;
+
+        let response = client
+            .try_recv_response::<lsp_types::GotoDefinitionResponse>()
+            .await;
+        assert!(response.is_ok());
+
+        client.shutdown().await?;
+        server.exit().await?;
         Ok(())
     }
 }
