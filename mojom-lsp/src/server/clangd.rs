@@ -23,7 +23,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader}
 use tokio::process::{Child, ChildStderr, ChildStdin, Command};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
-use super::document_symbol::{DocumentSymbol, InterfaceSymbol, MethodSymbol};
+use super::document_symbol::{DocumentSymbol, InterfaceSymbol, MethodSymbol, StructSymbol};
 use super::protocol::{ErrorCodes, Message, ResponseError, ResponseMessage};
 use super::rpc::{recv_message, send_notification, send_request};
 use super::server::RpcSender;
@@ -188,6 +188,29 @@ impl CppBindingHeader {
         None
     }
 
+    fn find_struct_symbol(&self, st: &StructSymbol) -> Option<lsp_types::Location> {
+        let mut location = self
+            .symbols
+            .iter()
+            .find(|symbol| {
+                // Clangd uses CLASS for `using FooPtr = mojom::StructPtr<Foo>;`
+                if symbol.kind != lsp_types::SymbolKind::CLASS {
+                    return false;
+                }
+                if !symbol.name.ends_with("Ptr") {
+                    return false;
+                }
+                let name = &symbol.name[..symbol.name.len() - "Ptr".len()];
+                st.name == name
+            })
+            .map(|symbol| symbol.location.clone())?;
+
+        // `location` starts with `using ` but we want to have a location that starts
+        // with the name of the alias.
+        location.range.start.character += "using ".len() as u32;
+        Some(location)
+    }
+
     fn find_symbol_location(&self, target_symbol: &DocumentSymbol) -> Option<lsp_types::Location> {
         match target_symbol {
             DocumentSymbol::Interface(interface) => self
@@ -206,6 +229,7 @@ impl CppBindingHeader {
 
                 Some(location)
             }
+            DocumentSymbol::Struct(st) => self.find_struct_symbol(st),
             _ => None,
         }
     }
@@ -378,11 +402,12 @@ impl Clangd {
 
         let mojom_uri = mojom_uri.clone();
         let mut bindings = Vec::new();
-        if let Ok(non_blink) = self.open_header(base_path.clone() + ".h").await {
-            bindings.push(non_blink);
-        }
-        if let Ok(blink) = self.open_header(base_path + "-blink.h").await {
-            bindings.push(blink);
+
+        const SUFFIXES: &[&str] = &[".h", "-forward.h", "-blink.h", "-blink-forward.h"];
+        for suffix in SUFFIXES {
+            if let Ok(header) = self.open_header(base_path.clone() + suffix).await {
+                bindings.push(header);
+            }
         }
         self.bindings = Some(CppBindings {
             mojom_uri,

@@ -186,6 +186,7 @@ impl MojomAst {
             _ => None,
         });
 
+        // Interfaces and methods.
         for interface in interfaces {
             if !interface.range.contains(offset) {
                 continue;
@@ -214,6 +215,21 @@ impl MojomAst {
                         range,
                     }));
                 }
+            }
+        }
+
+        // Structs
+        for stmt in self.mojom.stmts.iter() {
+            let st = match stmt {
+                syntax::Statement::Struct(st) => st,
+                _ => continue,
+            };
+            if st.name.contains(offset) {
+                return Some(DocumentSymbol::Struct(StructSymbol {
+                    name: self.text(&st.name).to_string(),
+                    name_range: self.lsp_range(&st.name),
+                    range: self.lsp_range(&st.range),
+                }));
             }
         }
 
