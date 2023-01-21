@@ -244,6 +244,17 @@ impl Workspace {
         };
 
         let position = &params.text_document_position_params.position;
+
+        if let Some(location) =
+            parsed
+                .ast
+                .import_path_from_position(&self.root_path, &self.gen_path, position)
+        {
+            self.rpc_sender.send_success_response(id, location).await?;
+            return Ok(());
+        }
+
+        // Find definition in the same document.
         let ident = parsed.ast.get_identifier(position);
         if let Some(range) = parsed.ast.find_definition(ident) {
             let location = lsp_types::Location::new(uri.clone(), range);
@@ -251,6 +262,7 @@ impl Workspace {
             return Ok(());
         }
 
+        // Find definition from imports.
         for import_uri in &parsed.import_uris {
             let import_symbols = match self.symbols.get(import_uri) {
                 Some(symbols) => symbols,

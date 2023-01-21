@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use lsp_types::Url as Uri;
 
@@ -21,6 +21,19 @@ use super::document_symbol::{
     UnionSymbol,
 };
 use crate::syntax::{self, MojomFile, Traversal};
+
+fn canonicalize_import_path(
+    path: &str,
+    root_path: impl AsRef<Path>,
+    gen_path: impl AsRef<Path>,
+) -> std::io::Result<PathBuf> {
+    let path = &path[1..path.len() - 1];
+    root_path
+        .as_ref()
+        .join(path)
+        .canonicalize()
+        .or(gen_path.as_ref().join(path).canonicalize())
+}
 
 fn create_semantics_diagnostic(range: lsp_types::Range, message: String) -> lsp_types::Diagnostic {
     lsp_types::Diagnostic {
@@ -107,14 +120,10 @@ impl MojomAst {
 
         let mut import_uris = Vec::new();
         for import in import_stmts {
-            let path = self.text(&import.path);
             // `import.path` include double quotes.
-            let path = &path[1..path.len() - 1];
-            let canonical_path = root_path
-                .as_ref()
-                .join(path)
-                .canonicalize()
-                .or(gen_path.as_ref().join(path).canonicalize());
+            let path = self.text(&import.path);
+            let canonical_path =
+                canonicalize_import_path(path, root_path.as_ref(), gen_path.as_ref());
             let canonical_path = match canonical_path {
                 Ok(path) => path,
                 Err(err) => {
@@ -278,6 +287,40 @@ impl MojomAst {
             }
         }
         symbols
+    }
+
+    pub(crate) fn import_path_from_position(
+        &self,
+        root_path: impl AsRef<Path>,
+        gen_path: impl AsRef<Path>,
+        position: &lsp_types::Position,
+    ) -> Option<lsp_types::Location> {
+        let offset = self.get_offset_from_position(position);
+        for stmt in &self.mojom.stmts {
+            let import = match stmt {
+                syntax::Statement::Import(import) => import,
+                _ => continue,
+            };
+            if import.range.contains(offset) {
+                let path = self.text(&import.path);
+                let path =
+                    match canonicalize_import_path(path, root_path.as_ref(), gen_path.as_ref()) {
+                        Ok(path) => path,
+                        Err(_) => continue,
+                    };
+                let uri = match Uri::from_file_path(path) {
+                    Ok(uri) => uri,
+                    Err(_) => continue,
+                };
+                let range = lsp_types::Range::new(
+                    lsp_types::Position::default(),
+                    lsp_types::Position::default(),
+                );
+                return Some(lsp_types::Location { uri, range });
+            }
+        }
+
+        None
     }
 
     pub(crate) fn find_definition(&self, ident: &str) -> Option<lsp_types::Range> {
