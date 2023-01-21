@@ -17,13 +17,14 @@ use crate::syntax;
 
 pub(crate) async fn workspace_task(
     root_path: PathBuf,
+    gen_path: PathBuf,
     rpc_sender: RpcSender,
     clangd_sender: Option<mpsc::Sender<ClangdMessage>>,
     sender: mpsc::Sender<WorkspaceMessage>,
     mut receiver: mpsc::Receiver<WorkspaceMessage>,
 ) -> anyhow::Result<()> {
-    check_workspace_mojoms(&root_path, sender)?;
-    let mut workspace = Workspace::new(root_path, rpc_sender, clangd_sender);
+    check_workspace_mojoms(&root_path, &gen_path, sender)?;
+    let mut workspace = Workspace::new(root_path, gen_path, rpc_sender, clangd_sender);
 
     while let Some(message) = receiver.recv().await {
         match message {
@@ -83,6 +84,7 @@ struct ParsedMojom {
 
 struct Workspace {
     root_path: PathBuf,
+    gen_path: PathBuf,
     rpc_sender: RpcSender,
     clangd_sender: Option<mpsc::Sender<ClangdMessage>>,
     parsed_files: HashMap<Uri, ParsedMojom>,
@@ -92,11 +94,13 @@ struct Workspace {
 impl Workspace {
     fn new(
         root_path: PathBuf,
+        gen_path: PathBuf,
         rpc_sender: RpcSender,
         clangd_sender: Option<mpsc::Sender<ClangdMessage>>,
     ) -> Self {
         Workspace {
             root_path,
+            gen_path,
             rpc_sender,
             clangd_sender,
             parsed_files: HashMap::new(),
@@ -252,13 +256,14 @@ impl Workspace {
                 Some(symbols) => symbols,
                 None => {
                     let path = import_uri.to_file_path().unwrap();
-                    let parsed = match parse_mojom_symbols(&self.root_path, path).await {
-                        Ok(parsed) => parsed,
-                        Err(err) => {
-                            log::debug!("Failed to parse import: {}: {:?}", import_uri, err);
-                            continue;
-                        }
-                    };
+                    let parsed =
+                        match parse_mojom_symbols(&self.root_path, &self.gen_path, path).await {
+                            Ok(parsed) => parsed,
+                            Err(err) => {
+                                log::debug!("Failed to parse import: {}: {:?}", import_uri, err);
+                                continue;
+                            }
+                        };
                     self.symbols.insert(import_uri.clone(), parsed);
                     self.symbols.get(import_uri).unwrap()
                 }
@@ -405,8 +410,14 @@ impl Workspace {
         self.symbols.remove(&uri);
 
         let mut diagnostics = Vec::new();
-        let parsed =
-            check_syntax_and_semantics(&self.root_path, text, version, &mut diagnostics).await;
+        let parsed = check_syntax_and_semantics(
+            &self.root_path,
+            &self.gen_path,
+            text,
+            version,
+            &mut diagnostics,
+        )
+        .await;
 
         if let Some(parsed) = parsed {
             let symbols = ParsedSymbols {
@@ -441,6 +452,7 @@ impl Workspace {
 
 fn check_workspace_mojoms(
     root_path: impl AsRef<Path>,
+    gen_path: impl AsRef<Path>,
     sender: mpsc::Sender<WorkspaceMessage>,
 ) -> anyhow::Result<()> {
     let mut directories = Vec::new();
@@ -460,6 +472,7 @@ fn check_workspace_mojoms(
                     let sender = sender.clone();
                     tokio::spawn(check_single_mojom(
                         root_path.as_ref().to_owned(),
+                        gen_path.as_ref().to_owned(),
                         path,
                         sender,
                     ));
@@ -472,12 +485,13 @@ fn check_workspace_mojoms(
 
 async fn check_single_mojom(
     root_path: PathBuf,
+    gen_path: PathBuf,
     path: PathBuf,
     sender: mpsc::Sender<WorkspaceMessage>,
 ) -> anyhow::Result<()> {
     let uri = lsp_types::Url::from_file_path(&path)
         .map_err(|err| anyhow::anyhow!("Failed to convert path to Uri: {:?}", err))?;
-    let parsed = parse_mojom_symbols(root_path, path).await?;
+    let parsed = parse_mojom_symbols(root_path, gen_path, path).await?;
     sender
         .send(WorkspaceMessage::DocumentSymbolsParsed(uri, parsed))
         .await?;
@@ -486,13 +500,14 @@ async fn check_single_mojom(
 
 async fn parse_mojom_symbols(
     root_path: impl AsRef<Path>,
+    gen_path: impl AsRef<Path>,
     path: PathBuf,
 ) -> anyhow::Result<ParsedSymbols> {
     let text = tokio::fs::read_to_string(&path).await?;
     let mojom =
         syntax::parse(&text).map_err(|err| anyhow::anyhow!("Failed to parse mojom: {:?}", err))?;
     let ast = MojomAst::from_mojom(text, mojom);
-    let mut result = ast.check_semantics(root_path);
+    let mut result = ast.check_semantics(root_path, gen_path);
     let module_name = result.module_name.take();
     let symbols = ast.get_document_symbols();
     let parsed = ParsedSymbols {
@@ -504,6 +519,7 @@ async fn parse_mojom_symbols(
 
 async fn check_syntax_and_semantics(
     root_path: impl AsRef<Path>,
+    gen_path: impl AsRef<Path>,
     text: String,
     version: Option<i32>,
     diagnostics: &mut Vec<lsp_types::Diagnostic>,
@@ -517,7 +533,7 @@ async fn check_syntax_and_semantics(
     };
 
     let ast = MojomAst::from_mojom(text, mojom);
-    let mut result = ast.check_semantics(root_path);
+    let mut result = ast.check_semantics(root_path, gen_path);
     let module_name = result.module_name;
     let import_uris = result.import_uris;
     diagnostics.append(&mut result.diagnostics);
@@ -536,10 +552,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_all_mojom() -> anyhow::Result<()> {
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata");
+        let root_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata");
+        let gen_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata");
         let (sender, mut receiver) = mpsc::channel(64);
 
-        check_workspace_mojoms(&path, sender)?;
+        check_workspace_mojoms(&root_path, &gen_path, sender)?;
 
         let mut num_parsed = 0;
         while let Some(message) = receiver.recv().await {

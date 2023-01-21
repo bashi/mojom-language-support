@@ -72,7 +72,11 @@ impl MojomAst {
         lsp_types::Range::new(start, end)
     }
 
-    pub(crate) fn check_semantics(&self, root_path: impl AsRef<Path>) -> SemanticsResult {
+    pub(crate) fn check_semantics(
+        &self,
+        root_path: impl AsRef<Path>,
+        gen_path: impl AsRef<Path>,
+    ) -> SemanticsResult {
         let mut diagnostics = Vec::new();
 
         // Find module name.
@@ -106,7 +110,12 @@ impl MojomAst {
             let path = self.text(&import.path);
             // `import.path` include double quotes.
             let path = &path[1..path.len() - 1];
-            let path = match root_path.as_ref().join(path).canonicalize() {
+            let canonical_path = root_path
+                .as_ref()
+                .join(path)
+                .canonicalize()
+                .or(gen_path.as_ref().join(path).canonicalize());
+            let canonical_path = match canonical_path {
                 Ok(path) => path,
                 Err(err) => {
                     let range = self.lsp_range(&import.range);
@@ -116,14 +125,14 @@ impl MojomAst {
                 }
             };
 
-            if !path.exists() {
+            if !canonical_path.exists() {
                 let range = self.lsp_range(&import.range);
-                let message = format!("Import path does not exist: {:?}", path);
+                let message = format!("Import path does not exist: {:?}", canonical_path);
                 diagnostics.push(create_semantics_diagnostic(range, message));
                 continue;
             }
 
-            let uri = Uri::from_file_path(path).unwrap();
+            let uri = Uri::from_file_path(canonical_path).unwrap();
             import_uris.push(uri);
         }
 

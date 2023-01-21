@@ -28,6 +28,7 @@ use super::workspace::{self, WorkspaceMessage};
 pub async fn run<R, W>(
     reader: R,
     mut writer: W,
+    out_path: PathBuf,
     clangd_params: Option<ClangdParams>,
 ) -> anyhow::Result<i32>
 where
@@ -47,11 +48,17 @@ where
     };
     log::info!("Initialized, path = {:?}", root_path);
 
+    let gen_path = if out_path.is_absolute() {
+        out_path.join("gen")
+    } else {
+        root_path.join(&out_path).join("gen")
+    };
+
     let rpc_sender = spawn_sender_task(writer);
 
     let clangd_sender = match clangd_params {
         Some(params) => {
-            let clangd = clangd::start(root_path.clone(), params).await?;
+            let clangd = clangd::start(root_path.clone(), gen_path.clone(), params).await?;
             let (clangd_sender, clangd_receiver) = mpsc::channel(64);
             let _clangd_task_handle = tokio::spawn(clangd::clangd_task(
                 clangd,
@@ -67,7 +74,8 @@ where
         let rpc_sender = rpc_sender.clone();
         let (sender, receiver) = mpsc::channel(64);
         let handle = tokio::spawn(workspace::workspace_task(
-            root_path.clone(),
+            root_path,
+            gen_path,
             rpc_sender,
             clangd_sender,
             sender.clone(),
@@ -376,8 +384,9 @@ mod tests {
     impl Server {
         fn new(stream: DuplexStream) -> Self {
             let handle = tokio::spawn(async move {
+                let out_path = workspace_root().join("out").join("Default");
                 let (reader, writer) = tokio::io::split(stream);
-                let exit_code = run(reader, writer, None).await?;
+                let exit_code = run(reader, writer, out_path, None).await?;
                 anyhow::Ok(exit_code)
             });
             Server { handle }

@@ -30,7 +30,6 @@ use super::server::RpcSender;
 
 pub struct ClangdParams {
     pub clangd_path: PathBuf,
-    pub out_dir: PathBuf,
     pub compile_commands_dir: Option<PathBuf>,
     pub log_level: Option<log::Level>,
 }
@@ -482,14 +481,12 @@ impl Clangd {
     }
 }
 
-pub(crate) async fn start(root_path: PathBuf, mut params: ClangdParams) -> anyhow::Result<Clangd> {
+pub(crate) async fn start(
+    root_path: PathBuf,
+    gen_path: PathBuf,
+    mut params: ClangdParams,
+) -> anyhow::Result<Clangd> {
     use std::process::Stdio;
-
-    let gen_path = if params.out_dir.is_absolute() {
-        params.out_dir.clone().join("gen")
-    } else {
-        root_path.join(&params.out_dir).join("gen")
-    };
 
     let mut command = Command::new(&params.clangd_path);
     command.stdin(Stdio::piped()).stdout(Stdio::piped());

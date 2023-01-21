@@ -24,7 +24,7 @@ struct Args {
     log_level: Option<log::Level>,
     /// Specify chromium out directory.
     #[arg(long, default_value = "out/Release")]
-    out_dir: PathBuf,
+    out_path: PathBuf,
     /// Enable clangd for C++ bindings symbol lookup.
     #[arg(long)]
     enable_clangd: bool,
@@ -55,7 +55,6 @@ pub fn main() -> anyhow::Result<()> {
     let clangd_params = if args.enable_clangd {
         Some(mojom_lsp::server::ClangdParams {
             clangd_path: args.clangd_path,
-            out_dir: args.out_dir,
             compile_commands_dir: args.clangd_compile_commands_dir,
             log_level: args.clangd_log_level,
         })
@@ -67,6 +66,7 @@ pub fn main() -> anyhow::Result<()> {
     let exit_code = rt.block_on(mojom_lsp::server::run(
         tokio::io::stdin(),
         tokio::io::stdout(),
+        args.out_path,
         clangd_params,
     ))?;
     std::process::exit(exit_code);
