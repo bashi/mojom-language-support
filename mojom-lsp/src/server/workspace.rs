@@ -198,17 +198,26 @@ impl Workspace {
             None => return Ok(()),
         };
 
-        let target_name_without_ptr = if target_name.ends_with("Ptr") {
-            Some(&target_name[..target_name.len() - 3])
-        } else {
-            None
+        let match_symbol = |symbol: &DocumentSymbol| {
+            if symbol.name() == target_name {
+                return true;
+            }
+            if target_name.ends_with("Ptr")
+                && symbol.name() == &target_name[..target_name.len() - "Ptr".len()]
+            {
+                return true;
+            }
+            if target_name.ends_with("InterfaceBase")
+                && symbol.name() == &target_name[..target_name.len() - "InterfaceBase".len()]
+            {
+                return true;
+            }
+            false
         };
 
         for (uri, parsed) in self.symbols.iter() {
             for symbol in parsed.symbols.iter() {
-                let matched =
-                    symbol.name() == target_name || Some(symbol.name()) == target_name_without_ptr;
-                if matched {
+                if match_symbol(symbol) {
                     let location =
                         lsp_types::Location::new(uri.clone(), symbol.name_range().clone());
                     #[allow(deprecated)]
