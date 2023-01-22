@@ -24,7 +24,7 @@ use tokio::process::{Child, ChildStderr, ChildStdin, Command};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
 use super::document_symbol::{
-    DocumentSymbol, InterfaceSymbol, MethodSymbol, StructFieldSymbol, StructSymbol,
+    DocumentSymbol, EnumSymbol, InterfaceSymbol, MethodSymbol, StructFieldSymbol, StructSymbol,
 };
 use super::protocol::{ErrorCodes, Message, ResponseError, ResponseMessage};
 use super::rpc::{recv_message, send_notification, send_request};
@@ -247,6 +247,54 @@ impl CppBindingHeader {
         None
     }
 
+    fn find_enum_symbol(&self, en: &EnumSymbol) -> Option<lsp_types::Location> {
+        if let Some(ref outer_name) = en.outer_name {
+            return self.find_nested_enum_symbol(outer_name, &en.name);
+        }
+
+        self.symbols
+            .iter()
+            .find(|symbol| {
+                if symbol.kind != lsp_types::SymbolKind::ENUM {
+                    return false;
+                }
+                en.name == symbol.name
+            })
+            .map(|symbol| symbol.location.clone())
+    }
+
+    fn find_nested_enum_symbol(&self, outer_name: &str, name: &str) -> Option<lsp_types::Location> {
+        let mut stack: Vec<&lsp_types::SymbolInformation> = Vec::new();
+        for symbol in self.symbols.iter() {
+            while let Some(outer) = stack.last() {
+                if outer.location.range.end >= symbol.location.range.start {
+                    break;
+                }
+                stack.pop();
+            }
+
+            if symbol.kind != lsp_types::SymbolKind::CLASS {
+                continue;
+            }
+
+            if symbol.name == name {
+                let outer = match stack.last() {
+                    Some(outer) => outer,
+                    None => continue,
+                };
+                if outer.name == outer_name {
+                    let mut location = symbol.location.clone();
+                    // Remove `using ` from location.
+                    location.range.start.character += "using ".len() as u32;
+                    return Some(location);
+                }
+            }
+
+            stack.push(symbol);
+        }
+        None
+    }
+
     fn find_symbol_location(&self, target_symbol: &DocumentSymbol) -> Option<lsp_types::Location> {
         match target_symbol {
             DocumentSymbol::Interface(interface) => self
@@ -267,6 +315,7 @@ impl CppBindingHeader {
             }
             DocumentSymbol::Struct(st) => self.find_struct_symbol(st),
             DocumentSymbol::StructField(field) => self.find_struct_field_symbol(field),
+            DocumentSymbol::Enum(en) => self.find_enum_symbol(en),
             _ => None,
         }
     }

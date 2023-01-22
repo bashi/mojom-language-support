@@ -184,74 +184,105 @@ impl MojomAst {
         position: &lsp_types::Position,
     ) -> Option<DocumentSymbol> {
         let offset = self.get_offset_from_position(position);
-        let interfaces = self.mojom.stmts.iter().filter_map(|stmt| match stmt {
-            syntax::Statement::Interface(interface) => Some(interface),
-            _ => None,
-        });
 
-        // Interfaces and methods.
-        for interface in interfaces {
-            if !interface.range.contains(offset) {
-                continue;
-            }
-            if interface.name.contains(offset) {
-                return Some(DocumentSymbol::Interface(InterfaceSymbol {
-                    name: self.text(&interface.name).to_string(),
-                    name_range: self.lsp_range(&interface.name),
-                    range: self.lsp_range(&interface.range),
-                }));
-            }
-
-            let methods = interface.members.iter().filter_map(|member| match member {
-                syntax::InterfaceMember::Method(method) => Some(method),
-                _ => None,
-            });
-            for method in methods {
-                if method.name.contains(offset) {
-                    let interface_name = self.text(&interface.name).to_string();
-                    let name = self.text(&method.name).to_string();
-                    let range = self.lsp_range(&method.range);
-                    return Some(DocumentSymbol::Method(MethodSymbol {
-                        name,
-                        name_range: self.lsp_range(&method.name),
-                        interface_name,
-                        range,
-                    }));
-                }
-            }
-        }
-
-        // Structs and struct fields.
         for stmt in self.mojom.stmts.iter() {
-            let st = match stmt {
-                syntax::Statement::Struct(st) => st,
-                _ => continue,
-            };
-            if st.name.contains(offset) {
-                return Some(DocumentSymbol::Struct(StructSymbol {
-                    name: self.text(&st.name).to_string(),
-                    name_range: self.lsp_range(&st.name),
-                    range: self.lsp_range(&st.range),
-                }));
-            }
+            match stmt {
+                // Interfaces and interface members.
+                syntax::Statement::Interface(interface) => {
+                    if !interface.range.contains(offset) {
+                        continue;
+                    }
+                    if interface.name.contains(offset) {
+                        return Some(DocumentSymbol::Interface(InterfaceSymbol {
+                            name: self.text(&interface.name).to_string(),
+                            name_range: self.lsp_range(&interface.name),
+                            range: self.lsp_range(&interface.range),
+                        }));
+                    }
 
-            for member in st.members.iter() {
-                let field = match member {
-                    syntax::StructBody::Field(field) => field,
-                    _ => continue,
-                };
-
-                if field.name.contains(offset) {
-                    let struct_name = self.text(&st.name).to_string();
-                    let name = self.text(&field.name).to_string();
-                    let range = self.lsp_range(&field.range);
-                    return Some(DocumentSymbol::StructField(StructFieldSymbol {
-                        name,
-                        name_range: self.lsp_range(&field.name),
-                        struct_name,
-                        range,
-                    }));
+                    for member in interface.members.iter() {
+                        match member {
+                            syntax::InterfaceMember::Method(method) => {
+                                if method.name.contains(offset) {
+                                    let interface_name = self.text(&interface.name).to_string();
+                                    let name = self.text(&method.name).to_string();
+                                    let range = self.lsp_range(&method.range);
+                                    return Some(DocumentSymbol::Method(MethodSymbol {
+                                        name,
+                                        name_range: self.lsp_range(&method.name),
+                                        interface_name,
+                                        range,
+                                    }));
+                                }
+                            }
+                            syntax::InterfaceMember::Enum(en) => {
+                                if en.name.contains(offset) {
+                                    return Some(DocumentSymbol::Enum(EnumSymbol {
+                                        name: self.text(&en.name).to_string(),
+                                        name_range: self.lsp_range(&en.name),
+                                        outer_name: Some(self.text(&interface.name).to_string()),
+                                        range: self.lsp_range(&en.range),
+                                    }));
+                                }
+                            }
+                            _ => (),
+                        }
+                    }
                 }
+                // Structs and struct fields.
+                syntax::Statement::Struct(st) => {
+                    if !st.range.contains(offset) {
+                        continue;
+                    }
+                    if st.name.contains(offset) {
+                        return Some(DocumentSymbol::Struct(StructSymbol {
+                            name: self.text(&st.name).to_string(),
+                            name_range: self.lsp_range(&st.name),
+                            range: self.lsp_range(&st.range),
+                        }));
+                    }
+
+                    for member in st.members.iter() {
+                        match member {
+                            syntax::StructBody::Field(field) => {
+                                if field.name.contains(offset) {
+                                    let struct_name = self.text(&st.name).to_string();
+                                    let name = self.text(&field.name).to_string();
+                                    let range = self.lsp_range(&field.range);
+                                    return Some(DocumentSymbol::StructField(StructFieldSymbol {
+                                        name,
+                                        name_range: self.lsp_range(&field.name),
+                                        struct_name,
+                                        range,
+                                    }));
+                                }
+                            }
+                            syntax::StructBody::Enum(en) => {
+                                if en.name.contains(offset) {
+                                    return Some(DocumentSymbol::Enum(EnumSymbol {
+                                        name: self.text(&en.name).to_string(),
+                                        name_range: self.lsp_range(&en.name),
+                                        outer_name: Some(self.text(&st.name).to_string()),
+                                        range: self.lsp_range(&en.range),
+                                    }));
+                                }
+                            }
+                            _ => (),
+                        }
+                    }
+                }
+                // Enums
+                syntax::Statement::Enum(en) => {
+                    if en.name.contains(offset) {
+                        return Some(DocumentSymbol::Enum(EnumSymbol {
+                            name: self.text(&en.name).to_string(),
+                            name_range: self.lsp_range(&en.name),
+                            outer_name: None,
+                            range: self.lsp_range(&en.range),
+                        }));
+                    }
+                }
+                _ => (),
             }
         }
 
@@ -345,7 +376,20 @@ impl MojomAst {
                     push_symbol!(Union, UnionSymbol, node);
                 }
                 Traversal::Enum(node) => {
-                    push_symbol!(Enum, EnumSymbol, node);
+                    let container_name = interface
+                        .as_ref()
+                        .map(|i| i.clone())
+                        .or(st.as_ref().map(|s| s.clone()));
+                    let name_range = self.lsp_range(&node.name);
+                    let name = self.text(&node.name).to_string();
+                    let range = self.lsp_range(&node.range);
+                    let symbol = EnumSymbol {
+                        name,
+                        name_range,
+                        outer_name: container_name,
+                        range,
+                    };
+                    symbols.push(DocumentSymbol::Enum(symbol));
                 }
                 Traversal::Const(node) => {
                     push_symbol!(Const, ConstSymbol, node);

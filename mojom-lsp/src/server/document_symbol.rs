@@ -55,6 +55,7 @@ pub(crate) struct UnionSymbol {
 pub(crate) struct EnumSymbol {
     pub(crate) name: String,
     pub(crate) name_range: lsp_types::Range,
+    pub(crate) outer_name: Option<String>,
     pub(crate) range: lsp_types::Range,
 }
 
