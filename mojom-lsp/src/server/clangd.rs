@@ -23,7 +23,9 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader}
 use tokio::process::{Child, ChildStderr, ChildStdin, Command};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
-use super::document_symbol::{DocumentSymbol, InterfaceSymbol, MethodSymbol, StructSymbol};
+use super::document_symbol::{
+    DocumentSymbol, InterfaceSymbol, MethodSymbol, StructFieldSymbol, StructSymbol,
+};
 use super::protocol::{ErrorCodes, Message, ResponseError, ResponseMessage};
 use super::rpc::{recv_message, send_notification, send_request};
 use super::server::RpcSender;
@@ -211,6 +213,40 @@ impl CppBindingHeader {
         Some(location)
     }
 
+    fn find_struct_field_symbol(&self, field: &StructFieldSymbol) -> Option<lsp_types::Location> {
+        let mut stack: Vec<&lsp_types::SymbolInformation> = Vec::new();
+        for symbol in self.symbols.iter() {
+            while let Some(outer) = stack.last() {
+                if outer.location.range.end >= symbol.location.range.start {
+                    break;
+                }
+                stack.pop();
+            }
+
+            // C++ bindings use class for struct.
+            if symbol.kind == lsp_types::SymbolKind::CLASS {
+                stack.push(symbol);
+                continue;
+            }
+
+            if symbol.kind != lsp_types::SymbolKind::FIELD || symbol.name != field.name {
+                continue;
+            }
+
+            if let Some(st) = stack.last() {
+                if st.name == field.struct_name {
+                    let mut location = symbol.location.clone();
+                    // `location` starts with the type of the field but we want to use
+                    // location of the field name. Use the end position to work around.
+                    location.range.start.line = location.range.end.line;
+                    location.range.start.character = location.range.end.character - 1;
+                    return Some(location);
+                }
+            }
+        }
+        None
+    }
+
     fn find_symbol_location(&self, target_symbol: &DocumentSymbol) -> Option<lsp_types::Location> {
         match target_symbol {
             DocumentSymbol::Interface(interface) => self
@@ -230,6 +266,7 @@ impl CppBindingHeader {
                 Some(location)
             }
             DocumentSymbol::Struct(st) => self.find_struct_symbol(st),
+            DocumentSymbol::StructField(field) => self.find_struct_field_symbol(field),
             _ => None,
         }
     }

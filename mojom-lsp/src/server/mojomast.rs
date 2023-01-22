@@ -20,7 +20,10 @@ use super::document_symbol::{
     ConstSymbol, DocumentSymbol, EnumSymbol, InterfaceSymbol, MethodSymbol, StructSymbol,
     UnionSymbol,
 };
-use crate::syntax::{self, MojomFile, Traversal};
+use crate::{
+    server::document_symbol::StructFieldSymbol,
+    syntax::{self, MojomFile, Traversal},
+};
 
 fn canonicalize_import_path(
     path: &str,
@@ -218,7 +221,7 @@ impl MojomAst {
             }
         }
 
-        // Structs
+        // Structs and struct fields.
         for stmt in self.mojom.stmts.iter() {
             let st = match stmt {
                 syntax::Statement::Struct(st) => st,
@@ -231,6 +234,25 @@ impl MojomAst {
                     range: self.lsp_range(&st.range),
                 }));
             }
+
+            for member in st.members.iter() {
+                let field = match member {
+                    syntax::StructBody::Field(field) => field,
+                    _ => continue,
+                };
+
+                if field.name.contains(offset) {
+                    let struct_name = self.text(&st.name).to_string();
+                    let name = self.text(&field.name).to_string();
+                    let range = self.lsp_range(&field.range);
+                    return Some(DocumentSymbol::StructField(StructFieldSymbol {
+                        name,
+                        name_range: self.lsp_range(&field.name),
+                        struct_name,
+                        range,
+                    }));
+                }
+            }
         }
 
         None
@@ -239,6 +261,7 @@ impl MojomAst {
     pub(crate) fn get_document_symbols(&self) -> Vec<DocumentSymbol> {
         let mut symbols = Vec::new();
         let mut interface = None;
+        let mut st = None;
 
         macro_rules! push_symbol {
             ($kind:tt, $typ:ident, $node:expr) => {
@@ -288,7 +311,35 @@ impl MojomAst {
                     symbols.push(DocumentSymbol::Method(symbol));
                 }
                 Traversal::EnterStruct(node) => {
-                    push_symbol!(Struct, StructSymbol, node);
+                    let name = self.text(&node.name).to_string();
+                    let name_range = self.lsp_range(&node.name);
+                    let range = self.lsp_range(&node.range);
+                    debug_assert!(st.is_none());
+                    st = Some(name.clone());
+                    let symbol = StructSymbol {
+                        name,
+                        name_range,
+                        range,
+                    };
+                    symbols.push(DocumentSymbol::Struct(symbol));
+                }
+                Traversal::LeaveStruct(_) => {
+                    debug_assert!(st.is_some());
+                    st = None;
+                }
+                Traversal::StructField(node) => {
+                    debug_assert!(st.is_some());
+                    let struct_name = st.as_ref().unwrap().clone();
+                    let name_range = self.lsp_range(&node.name);
+                    let name = self.text(&node.name).to_string();
+                    let range = self.lsp_range(&node.range);
+                    let symbol = StructFieldSymbol {
+                        struct_name,
+                        name,
+                        name_range,
+                        range,
+                    };
+                    symbols.push(DocumentSymbol::StructField(symbol));
                 }
                 Traversal::Union(node) => {
                     push_symbol!(Union, UnionSymbol, node);

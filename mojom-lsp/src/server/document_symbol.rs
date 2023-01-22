@@ -37,6 +37,14 @@ pub(crate) struct StructSymbol {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+pub(crate) struct StructFieldSymbol {
+    pub(crate) name: String,
+    pub(crate) name_range: lsp_types::Range,
+    pub(crate) struct_name: String,
+    pub(crate) range: lsp_types::Range,
+}
+
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct UnionSymbol {
     pub(crate) name: String,
     pub(crate) name_range: lsp_types::Range,
@@ -62,6 +70,7 @@ pub(crate) enum DocumentSymbol {
     Method(MethodSymbol),
     Interface(InterfaceSymbol),
     Struct(StructSymbol),
+    StructField(StructFieldSymbol),
     Union(UnionSymbol),
     Enum(EnumSymbol),
     Const(ConstSymbol),
@@ -73,6 +82,7 @@ impl DocumentSymbol {
             DocumentSymbol::Method(s) => &s.name,
             DocumentSymbol::Interface(s) => &s.name,
             DocumentSymbol::Struct(s) => &s.name,
+            DocumentSymbol::StructField(s) => &s.name,
             DocumentSymbol::Union(s) => &s.name,
             DocumentSymbol::Enum(s) => &s.name,
             DocumentSymbol::Const(s) => &s.name,
@@ -84,6 +94,7 @@ impl DocumentSymbol {
             DocumentSymbol::Method(s) => &s.name_range,
             DocumentSymbol::Interface(s) => &s.name_range,
             DocumentSymbol::Struct(s) => &s.name_range,
+            DocumentSymbol::StructField(s) => &s.name_range,
             DocumentSymbol::Union(s) => &s.name_range,
             DocumentSymbol::Enum(s) => &s.name_range,
             DocumentSymbol::Const(s) => &s.name_range,
@@ -95,6 +106,7 @@ impl DocumentSymbol {
             DocumentSymbol::Method(s) => &s.range,
             DocumentSymbol::Interface(s) => &s.range,
             DocumentSymbol::Struct(s) => &s.range,
+            DocumentSymbol::StructField(s) => &s.range,
             DocumentSymbol::Union(s) => &s.range,
             DocumentSymbol::Enum(s) => &s.range,
             DocumentSymbol::Const(s) => &s.range,
@@ -106,12 +118,14 @@ impl DocumentSymbol {
             DocumentSymbol::Method(_) => lsp_types::SymbolKind::METHOD,
             DocumentSymbol::Interface(_) => lsp_types::SymbolKind::INTERFACE,
             DocumentSymbol::Struct(_) => lsp_types::SymbolKind::STRUCT,
+            DocumentSymbol::StructField(_) => lsp_types::SymbolKind::FIELD,
             DocumentSymbol::Union(_) => lsp_types::SymbolKind::STRUCT,
             DocumentSymbol::Enum(_) => lsp_types::SymbolKind::ENUM,
             DocumentSymbol::Const(_) => lsp_types::SymbolKind::CONSTANT,
         }
     }
 
+    // TODO: Move this conversion to clangd's corresponding method.
     pub(crate) fn to_proxy_symbol(self) -> DocumentSymbol {
         match self {
             DocumentSymbol::Interface(s) => DocumentSymbol::Interface(InterfaceSymbol {
